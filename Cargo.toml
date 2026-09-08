@@ -1,0 +1,18 @@
+[package]
+name = "invoice-helper"
+version = "0.2.0"
+edition = "2021"
+description = "批量提取 PDF 发票销售方与价税合计并生成 Markdown 汇总"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+pdf-extract = "0.7"
+regex = "1.11"
+rfd = "0.15"
+rust_decimal = "1.36"
+
+[profile.release]
+strip = true
+lto = "thin"
