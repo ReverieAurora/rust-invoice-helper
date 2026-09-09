@@ -1,132 +1,786 @@
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::{self, Stdout, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use rfd::FileDialog;
 
-use crate::invoice::{process_folder, ProcessingMode};
+use crate::invoice::process_folder;
+use crate::model::{ProcessResult, ProcessingMode, ProgressUpdate, DEFAULT_MAX_FILES_PER_FOLDER};
+
+type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+const INLINE_HEIGHT: u16 = 17;
+const MAX_CONTENT_WIDTH: u16 = 88;
+const ACCENT: Color = Color::Rgb(217, 119, 87);
+const TEXT: Color = Color::Rgb(235, 235, 235);
+const MUTED: Color = Color::Rgb(128, 128, 128);
+const SUBTLE: Color = Color::Rgb(82, 82, 82);
+const SUCCESS: Color = Color::Rgb(94, 180, 120);
+const WARNING: Color = Color::Rgb(224, 170, 90);
+const ERROR: Color = Color::Rgb(220, 95, 95);
 
 pub fn run() -> Result<()> {
-    print_banner();
-    let mode = select_mode()?;
-    let folder = select_folder()?;
-
-    println!();
-    println!("已选择目录：{}", folder.display());
-    println!("处理模式：{}", mode.label());
-    println!("模式说明：{}", mode.description());
-    println!();
-    println!("开始读取 PDF……");
-
-    let result = process_folder(&folder, None, mode, |progress| {
-        println!(
-            "[{}/{}] {}",
-            progress.current, progress.total, progress.file_name
-        );
-    })?;
-
-    println!();
-    println!("==================== 处理完成 ====================");
-    println!("PDF 总数：{}", result.pdf_count);
-    println!("成功提取：{}", result.success_count);
-    println!("提取失败：{}", result.failed_count);
-    println!("符合当前模式的销售方：{}", result.qualified_count);
-    println!("报告位置：{}", result.output.display());
-    println!("==================================================");
-
-    if confirm("是否在资源管理器中显示报告？", true)? {
-        reveal_in_explorer(&result.output)?;
-    }
-
-    pause_before_exit();
-    Ok(())
-}
-
-fn print_banner() {
-    println!("==================================================");
-    println!("              Rust 发票小助手 v0.2");
-    println!("==================================================");
-    println!("读取电子发票的销售方名称和价税合计，并生成 Markdown 汇总报告。");
-    println!();
-}
-
-fn select_mode() -> Result<ProcessingMode> {
-    println!("请选择处理模式：");
-    for (index, mode) in ProcessingMode::ALL.iter().enumerate() {
-        println!("  {}. {}", index + 1, mode.label());
-    }
+    let mut terminal = TerminalSession::new()?;
+    let mut remembered_batch_limit = Some(DEFAULT_MAX_FILES_PER_FOLDER);
 
     loop {
-        let input = prompt("请输入序号（直接回车默认选择 1）：")?;
-        let selected = if input.is_empty() {
-            1
-        } else {
-            match input.parse::<usize>() {
-                Ok(value) => value,
-                Err(_) => {
-                    println!("请输入有效的数字序号。");
-                    continue;
+        let SetupAction::Start {
+            mode,
+            source_folder,
+            max_files_per_folder,
+        } = setup_screen(&mut terminal, remembered_batch_limit)?
+        else {
+            return Ok(());
+        };
+        remembered_batch_limit = max_files_per_folder;
+
+        match process_with_progress(&mut terminal, &source_folder, mode, max_files_per_folder) {
+            Ok(result) => {
+                drain_pending_events()?;
+                if completion_screen(&mut terminal, &result)? == NextAction::Exit {
+                    return Ok(());
                 }
             }
-        };
+            Err(error) => {
+                drain_pending_events()?;
+                if error_screen(&mut terminal, &format!("{error:#}"))? == NextAction::Exit {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
 
-        if selected == 0 {
-            println!("没有这个模式，请重新选择。");
+enum SetupAction {
+    Start {
+        mode: ProcessingMode,
+        source_folder: PathBuf,
+        max_files_per_folder: Option<usize>,
+    },
+    Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NextAction {
+    Again,
+    Exit,
+}
+
+fn setup_screen(
+    terminal: &mut TerminalSession,
+    initial_batch_limit: Option<usize>,
+) -> Result<SetupAction> {
+    let mut selected_mode = 0_usize;
+    let mut source_folder = None;
+    let mut max_files_per_folder = initial_batch_limit;
+    let mut batch_limit_input = None::<String>;
+    let mut notice = "直接按 Enter，选择文件夹后自动开始".to_owned();
+
+    loop {
+        terminal
+            .terminal
+            .draw(|frame| {
+                render_setup(
+                    frame,
+                    selected_mode,
+                    source_folder.as_deref(),
+                    max_files_per_folder,
+                    batch_limit_input.as_deref(),
+                    &notice,
+                )
+            })
+            .context("无法绘制 TUI 设置界面")?;
+
+        let key = read_key()?;
+        if batch_limit_input.is_some() {
+            match key {
+                KeyCode::Char(character) if character.is_ascii_digit() => {
+                    let input = batch_limit_input.as_mut().expect("编辑状态应存在输入值");
+                    if input.len() < 9 {
+                        input.push(character);
+                    }
+                }
+                KeyCode::Backspace => {
+                    batch_limit_input
+                        .as_mut()
+                        .expect("编辑状态应存在输入值")
+                        .pop();
+                }
+                KeyCode::Enter => {
+                    let input = batch_limit_input.as_deref().expect("编辑状态应存在输入值");
+                    match parse_batch_limit_input(input) {
+                        Ok(limit) => {
+                            max_files_per_folder = limit;
+                            batch_limit_input = None;
+                            notice = format!(
+                                "分批上限已设为{}",
+                                batch_limit_description(max_files_per_folder)
+                            );
+                        }
+                        Err(message) => notice = message.to_owned(),
+                    }
+                }
+                KeyCode::Esc => {
+                    batch_limit_input = None;
+                    notice = "已取消修改分批上限".to_owned();
+                }
+                _ => {}
+            }
             continue;
         }
 
-        if let Some(mode) = ProcessingMode::ALL.get(selected - 1) {
-            println!("已选择：{}", mode.label());
-            return Ok(*mode);
+        match key {
+            KeyCode::Up => selected_mode = selected_mode.saturating_sub(1),
+            KeyCode::Down => {
+                selected_mode =
+                    (selected_mode + 1).min(ProcessingMode::ALL.len().saturating_sub(1));
+            }
+            KeyCode::Char('1') => selected_mode = 0,
+            KeyCode::Char('2') if ProcessingMode::ALL.len() >= 2 => selected_mode = 1,
+            KeyCode::Char('m' | 'M') => {
+                batch_limit_input = Some(String::new());
+                notice = "输入每个发票文件夹的上限；0 表示不限制".to_owned();
+            }
+            KeyCode::Char('f' | 'F' | 'o' | 'O') => {
+                if let Some(folder) = pick_source_folder(terminal)? {
+                    notice = "目录已选择；按 Enter 开始处理".to_owned();
+                    source_folder = Some(folder);
+                } else {
+                    notice = "已取消文件夹选择".to_owned();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(folder) = source_folder.clone() {
+                    return Ok(SetupAction::Start {
+                        mode: ProcessingMode::ALL[selected_mode],
+                        source_folder: folder,
+                        max_files_per_folder,
+                    });
+                }
+
+                if let Some(folder) = pick_source_folder(terminal)? {
+                    return Ok(SetupAction::Start {
+                        mode: ProcessingMode::ALL[selected_mode],
+                        source_folder: folder,
+                        max_files_per_folder,
+                    });
+                }
+                notice = "已取消；按 Enter 可以重新选择".to_owned();
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Ok(SetupAction::Quit),
+            _ => {}
         }
-        println!("没有这个模式，请重新选择。");
     }
 }
 
-fn select_folder() -> Result<PathBuf> {
-    println!();
-    println!("即将打开 Windows 文件夹选择窗口。");
-    let _ = prompt("按回车继续……")?;
-
-    FileDialog::new()
+fn pick_source_folder(terminal: &mut TerminalSession) -> Result<Option<PathBuf>> {
+    terminal.suspend()?;
+    let selected = FileDialog::new()
         .set_title("请选择 PDF 发票所在文件夹")
-        .pick_folder()
-        .ok_or_else(|| anyhow!("未选择文件夹，操作已取消"))
+        .pick_folder();
+    terminal.resume()?;
+    Ok(selected)
 }
 
-fn confirm(question: &str, default_yes: bool) -> Result<bool> {
-    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+fn process_with_progress(
+    terminal: &mut TerminalSession,
+    source_folder: &Path,
+    mode: ProcessingMode,
+    max_files_per_folder: Option<usize>,
+) -> Result<ProcessResult> {
+    terminal
+        .terminal
+        .draw(|frame| render_progress(frame, mode, source_folder, max_files_per_folder, None))
+        .context("无法绘制 TUI 进度界面")?;
+
+    let mut draw_error = None;
+    let result = process_folder(
+        source_folder,
+        None,
+        mode,
+        max_files_per_folder,
+        |progress| {
+            if draw_error.is_some() {
+                return;
+            }
+            if let Err(error) = terminal.terminal.draw(|frame| {
+                render_progress(
+                    frame,
+                    mode,
+                    source_folder,
+                    max_files_per_folder,
+                    Some(&progress),
+                );
+            }) {
+                draw_error = Some(error);
+            }
+        },
+    );
+
+    if let Some(error) = draw_error {
+        return Err(error).context("处理仍在继续，但无法刷新 TUI 进度");
+    }
+    result
+}
+
+fn completion_screen(terminal: &mut TerminalSession, result: &ProcessResult) -> Result<NextAction> {
     loop {
-        let answer = prompt(&format!("{question} {hint} "))?.to_lowercase();
-        match answer.as_str() {
-            "" => return Ok(default_yes),
-            "y" | "yes" | "是" => return Ok(true),
-            "n" | "no" | "否" => return Ok(false),
-            _ => println!("请输入 y 或 n。"),
+        terminal
+            .terminal
+            .draw(|frame| render_completion(frame, result))
+            .context("无法绘制 TUI 完成界面")?;
+
+        match read_key()? {
+            KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                return Ok(NextAction::Exit);
+            }
+            _ => {}
         }
     }
 }
 
-fn prompt(message: &str) -> Result<String> {
-    print!("{message}");
-    io::stdout().flush().context("无法刷新终端输出")?;
+fn error_screen(terminal: &mut TerminalSession, message: &str) -> Result<NextAction> {
+    loop {
+        terminal
+            .terminal
+            .draw(|frame| render_error(frame, message))
+            .context("无法绘制 TUI 错误界面")?;
 
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("无法读取终端输入")?;
-    Ok(input.trim().to_owned())
+        match read_key()? {
+            KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                return Ok(NextAction::Exit);
+            }
+            _ => {}
+        }
+    }
 }
 
-fn reveal_in_explorer(path: &std::path::Path) -> Result<()> {
-    Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn()
-        .context("无法打开 Windows 资源管理器")?;
+fn render_setup(
+    frame: &mut Frame,
+    selected_mode: usize,
+    source_folder: Option<&Path>,
+    max_files_per_folder: Option<usize>,
+    batch_limit_input: Option<&str>,
+    notice: &str,
+) {
+    frame.render_widget(Clear, frame.area());
+    let area = centered_content(frame.area());
+    let path = source_folder
+        .map(|value| value.display().to_string())
+        .unwrap_or_else(|| "尚未选择".to_owned());
+    let path = truncate_middle(&path, area.width.saturating_sub(8) as usize);
+
+    let mut lines = vec![brand_line("设置"), subtitle_line(), divider(area.width)];
+    lines.push(Line::from(Span::styled(
+        "  选择处理方式",
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::default());
+
+    for (index, mode) in ProcessingMode::ALL.iter().enumerate() {
+        let selected = index == selected_mode;
+        let rail = if selected { "  │ " } else { "    " };
+        let marker = if selected { "❯ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                rail,
+                Style::default().fg(if selected { ACCENT } else { SUBTLE }),
+            ),
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(if selected { ACCENT } else { SUBTLE })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                mode.label(),
+                Style::default()
+                    .fg(if selected { TEXT } else { MUTED })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{}{}",
+                if selected { "  │   " } else { "      " },
+                mode.description()
+            ),
+            Style::default().fg(if selected { MUTED } else { SUBTLE }),
+        )));
+    }
+
+    let (batch_value, batch_style, batch_hint) = match batch_limit_input {
+        Some(input) => (
+            format!("{input}▌"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            "  0 = 不限制 · Enter 确认 · Esc 取消",
+        ),
+        None => (
+            batch_limit_description(max_files_per_folder),
+            Style::default().fg(TEXT),
+            "  M 修改",
+        ),
+    };
+
+    lines.extend([
+        Line::default(),
+        Line::from(vec![
+            Span::styled("  分批上限  ", Style::default().fg(MUTED)),
+            Span::styled(batch_value, batch_style),
+            Span::styled(batch_hint, Style::default().fg(SUBTLE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  来源目录  ", Style::default().fg(MUTED)),
+            Span::styled(
+                path,
+                Style::default().fg(if source_folder.is_some() {
+                    TEXT
+                } else {
+                    WARNING
+                }),
+            ),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            format!("  {notice}"),
+            Style::default().fg(if notice.contains("取消") {
+                WARNING
+            } else {
+                MUTED
+            }),
+        )),
+        divider(area.width),
+        setup_footer(area.width),
+    ]);
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_progress(
+    frame: &mut Frame,
+    mode: ProcessingMode,
+    source_folder: &Path,
+    max_files_per_folder: Option<usize>,
+    progress: Option<&ProgressUpdate>,
+) {
+    frame.render_widget(Clear, frame.area());
+    let area = centered_content(frame.area());
+    let (current, total) = progress
+        .map(|value| (value.current, value.total))
+        .unwrap_or((0, 0));
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        (current as f64 / total as f64).clamp(0.0, 1.0)
+    };
+    let bar_width = (area.width as usize).saturating_sub(24).clamp(10, 36);
+    let (filled, empty) = progress_segments(ratio, bar_width);
+    let current_file = progress
+        .map(|value| value.file_name.as_str())
+        .unwrap_or("正在扫描目录中的 PDF……");
+    let current_file = truncate_middle(current_file, area.width.saturating_sub(6) as usize);
+    let source = truncate_middle(
+        &source_folder.display().to_string(),
+        area.width.saturating_sub(8) as usize,
+    );
+
+    let progress_label = if total == 0 {
+        "准备中".to_owned()
+    } else {
+        format!("{:>3}%   {current} / {total}", (ratio * 100.0).round())
+    };
+    let spinner = spinner_glyph(current);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "正在处理发票",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(mode.label(), Style::default().fg(MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled("  分批  ", Style::default().fg(SUBTLE)),
+            Span::styled(
+                batch_limit_description(max_files_per_folder),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        divider(area.width),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(filled, Style::default().fg(ACCENT)),
+            Span::styled(empty, Style::default().fg(SUBTLE)),
+            Span::raw("  "),
+            Span::styled(progress_label, Style::default().fg(TEXT)),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("  当前  ", Style::default().fg(MUTED)),
+            Span::styled(current_file, Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("  目录  ", Style::default().fg(MUTED)),
+            Span::styled(source, Style::default().fg(MUTED)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "  有限并行 · 每份 PDF 独立隔离 · 单份异常不会中止整批任务",
+            Style::default().fg(SUBTLE),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_completion(frame: &mut Frame, result: &ProcessResult) {
+    frame.render_widget(Clear, frame.area());
+    let area = centered_content(frame.area());
+    let output = truncate_middle(
+        &result.output.display().to_string(),
+        area.width.saturating_sub(4) as usize,
+    );
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "✓ ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "处理完成",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("  共处理 {} 份 PDF", result.pdf_count),
+            Style::default().fg(MUTED),
+        )),
+        divider(area.width),
+        Line::from(vec![
+            metric(result.success_count, "有效发票", SUCCESS),
+            separator(),
+            metric(result.failed_count, "待核查", WARNING),
+            separator(),
+            metric(result.skipped_count, "非发票", MUTED),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("  {} ", result.qualified_count),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("个销售方累计金额 ≥ 1000 元", Style::default().fg(MUTED)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled("  输出位置", Style::default().fg(MUTED))),
+        Line::from(Span::styled(
+            format!("  {output}"),
+            Style::default().fg(TEXT),
+        )),
+        divider(area.width),
+        key_hints(&[("Enter", "退出"), ("R", "再处理一个目录")]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_error(frame: &mut Frame, message: &str) {
+    frame.render_widget(Clear, frame.area());
+    let area = centered_content(frame.area());
+    let message = truncate_middle(message, area.width.saturating_sub(4) as usize * 3);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "× ",
+                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "处理失败",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        divider(area.width),
+        Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(ERROR),
+        )),
+        divider(area.width),
+        key_hints(&[("R", "返回重新选择"), ("Enter", "退出")]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn brand_line(page: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "✦ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Rust 发票小助手",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  v{}  ·  {page}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(MUTED),
+        ),
+    ])
+}
+
+fn subtitle_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "  本地离线处理 · 文件不会上传 · 原始 PDF 保持不变",
+        Style::default().fg(SUBTLE),
+    ))
+}
+
+fn setup_footer(width: u16) -> Line<'static> {
+    if width < 68 {
+        key_hints(&[
+            ("Enter", "开始"),
+            ("↑↓", "模式"),
+            ("M", "分批"),
+            ("Q", "退出"),
+        ])
+    } else {
+        key_hints(&[
+            ("Enter", "开始"),
+            ("↑↓", "模式"),
+            ("M", "分批上限"),
+            ("F", "选择目录"),
+            ("Q", "退出"),
+        ])
+    }
+}
+
+fn batch_limit_description(limit: Option<usize>) -> String {
+    limit
+        .map(|value| format!("每文件夹最多 {value} 张"))
+        .unwrap_or_else(|| "不限制（全部放入发票_01）".to_owned())
+}
+
+fn parse_batch_limit_input(value: &str) -> std::result::Result<Option<usize>, &'static str> {
+    if value.is_empty() {
+        return Err("请输入数字；0 表示不限制");
+    }
+    match value.parse::<usize>() {
+        Ok(0) => Ok(None),
+        Ok(limit) => Ok(Some(limit)),
+        Err(_) => Err("数量过大，请输入较小的整数"),
+    }
+}
+
+fn divider(width: u16) -> Line<'static> {
+    let line_width = width.saturating_sub(4).min(56) as usize;
+    Line::from(Span::styled(
+        format!("  {}", "─".repeat(line_width)),
+        Style::default().fg(SUBTLE),
+    ))
+}
+
+fn key_hints(items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, (key, label)) in items.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(SUBTLE)));
+        }
+        spans.push(Span::styled(
+            (*key).to_owned(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn metric(value: usize, label: &'static str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("  {value} {label}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn separator() -> Span<'static> {
+    Span::styled("  ·", Style::default().fg(SUBTLE))
+}
+
+fn centered_content(area: Rect) -> Rect {
+    let width = area.width.min(MAX_CONTENT_WIDTH);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y,
+        width,
+        height: area.height,
+    }
+}
+
+fn progress_segments(ratio: f64, width: usize) -> (String, String) {
+    let filled = ((ratio.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    ("━".repeat(filled), "─".repeat(width - filled))
+}
+
+fn spinner_glyph(step: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    FRAMES[step % FRAMES.len()]
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".chars().take(max_chars).collect();
+    }
+
+    let available = max_chars - 1;
+    let left_count = available.div_ceil(2);
+    let right_count = available / 2;
+    let left = value.chars().take(left_count).collect::<String>();
+    let right = value
+        .chars()
+        .rev()
+        .take(right_count)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{left}…{right}")
+}
+
+fn read_key() -> Result<KeyCode> {
+    loop {
+        if let Event::Key(key) = event::read().context("无法读取键盘输入")? {
+            if key.kind == KeyEventKind::Press {
+                return Ok(key.code);
+            }
+        }
+    }
+}
+
+fn drain_pending_events() -> Result<()> {
+    while event::poll(Duration::ZERO).context("无法检查终端输入")? {
+        let _ = event::read().context("无法清理终端输入")?;
+    }
     Ok(())
 }
 
+struct TerminalSession {
+    terminal: AppTerminal,
+    active: bool,
+}
+
+impl TerminalSession {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("无法启用终端原始输入模式")?;
+
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, cursor::Hide) {
+            let _ = disable_raw_mode();
+            return Err(error).context("无法隐藏终端光标");
+        }
+
+        let backend = CrosstermBackend::new(stdout);
+        let options = TerminalOptions {
+            viewport: Viewport::Inline(INLINE_HEIGHT),
+        };
+        let terminal = match Terminal::with_options(backend, options) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), cursor::Show);
+                return Err(error).context("无法初始化内联 TUI 终端");
+            }
+        };
+
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        disable_raw_mode().context("无法暂停终端原始输入模式")?;
+        self.terminal.show_cursor().context("无法显示终端光标")?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        enable_raw_mode().context("无法恢复终端原始输入模式")?;
+        self.active = true;
+        self.terminal.hide_cursor().context("无法隐藏终端光标")?;
+        self.terminal.clear().context("无法刷新内联 TUI")?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let _ = self.terminal.show_cursor();
+    }
+}
+
 pub fn pause_before_exit() {
-    let _ = prompt("\n按回车键退出……");
+    print!("\n按回车键退出……");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn middle_truncation_keeps_both_path_ends() {
+        assert_eq!(truncate_middle("1234567890", 7), "123…890");
+        assert_eq!(truncate_middle("短路径", 10), "短路径");
+    }
+
+    #[test]
+    fn progress_segments_keep_requested_width() {
+        let (filled, empty) = progress_segments(0.5, 10);
+        assert_eq!(filled.chars().count(), 5);
+        assert_eq!(empty.chars().count(), 5);
+    }
+
+    #[test]
+    fn batch_limit_input_supports_custom_and_unlimited_values() {
+        assert_eq!(parse_batch_limit_input("30"), Ok(Some(30)));
+        assert_eq!(parse_batch_limit_input("1"), Ok(Some(1)));
+        assert_eq!(parse_batch_limit_input("0"), Ok(None));
+        assert!(parse_batch_limit_input("").is_err());
+    }
 }

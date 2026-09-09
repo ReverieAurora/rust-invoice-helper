@@ -1,93 +1,25 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
-use anyhow::{anyhow, bail, Context, Result};
-use chrono::Local;
-use regex::Regex;
-use rust_decimal::Decimal;
+use anyhow::{bail, Context, Result};
 
-const THOUSAND_YUAN: Decimal = Decimal::from_parts(1000, 0, 0, false, 0);
+use crate::export;
+use crate::model::{
+    InvoiceRecord, IssueKind, ProcessResult, ProcessingMode, ProgressUpdate, RawInvoiceData,
+    RecordState, SellerSummaries, ValidationIssue, EXPECTED_BUYER_NAME, EXPECTED_BUYER_TAX_ID,
+};
+use crate::parser;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessingMode {
-    SellerTotalAtLeast1000,
-}
-
-impl ProcessingMode {
-    pub const ALL: [Self; 1] = [Self::SellerTotalAtLeast1000];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SellerTotalAtLeast1000 => "销售方累计金额 ≥ 1000 元",
-        }
-    }
-
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::SellerTotalAtLeast1000 => {
-                "按销售方名称合并发票价税合计，并列出累计金额大于等于 1000.00 元的销售方。"
-            }
-        }
-    }
-
-    fn qualifies(self, total: Decimal) -> bool {
-        match self {
-            Self::SellerTotalAtLeast1000 => total >= THOUSAND_YUAN,
-        }
-    }
-
-    fn ai_prompt(self) -> &'static str {
-        match self {
-            Self::SellerTotalAtLeast1000 => {
-                "请读取本文件“发票明细”中的全部成功记录，以销售方名称进行精确分组，将同一销售方各张发票的“价税合计（元）”相加。请列出累计金额大于等于 1000.00 元的销售方，并给出销售方名称、发票数量、合计金额以及所包含的发票文件名。金额统一保留两位小数。忽略提取失败的记录，不要根据文件名猜测缺失信息。请核对计算结果与“销售方汇总”部分；如有差异，明确指出。如果没有符合条件的销售方，请直接说明“没有符合条件的销售方”。"
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProgressUpdate {
-    pub current: usize,
-    pub total: usize,
-    pub file_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessResult {
-    pub output: PathBuf,
-    pub pdf_count: usize,
-    pub success_count: usize,
-    pub failed_count: usize,
-    pub qualified_count: usize,
-}
-
-#[derive(Debug)]
-struct InvoiceRecord {
-    file_name: String,
-    seller: Option<String>,
-    total: Option<Decimal>,
-    errors: Vec<String>,
-}
-
-impl InvoiceRecord {
-    fn is_success(&self) -> bool {
-        self.seller.is_some() && self.total.is_some() && self.errors.is_empty()
-    }
-}
-
-#[derive(Debug, Default)]
-struct SellerSummary {
-    count: usize,
-    total: Decimal,
-    files: Vec<String>,
-}
+const MAX_PARALLEL_PDFS: usize = 8;
 
 pub fn process_folder<F>(
     folder: &Path,
     output: Option<&Path>,
     mode: ProcessingMode,
+    max_files_per_folder: Option<usize>,
     mut on_progress: F,
 ) -> Result<ProcessResult>
 where
@@ -99,56 +31,121 @@ where
 
     let pdf_files = find_pdf_files(folder)?;
     if pdf_files.is_empty() {
-        bail!("所选文件夹中没有 PDF 文件：{}", folder.display());
+        bail!("所选文件夹第一层中没有 PDF 文件：{}", folder.display());
     }
 
-    let records = pdf_files
-        .iter()
-        .enumerate()
-        .map(|(index, path)| {
-            on_progress(ProgressUpdate {
-                current: index + 1,
-                total: pdf_files.len(),
-                file_name: display_file_name(path),
-            });
-            process_pdf(path)
-        })
-        .collect::<Vec<_>>();
+    let mut records = process_pdfs(folder, &pdf_files, mode, &mut on_progress);
 
     let summaries = summarize(&records);
-    let output = match output {
-        Some(path) => {
-            if path.exists() {
-                bail!("为避免覆盖已有数据，输出文件已存在：{}", path.display());
-            }
-            path.to_owned()
-        }
-        None => unique_default_output(folder),
-    };
-
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("无法创建输出目录：{}", parent.display()))?;
+    for record in &mut records {
+        record.seller_total = record
+            .raw
+            .seller_name
+            .as_ref()
+            .and_then(|seller| summaries.get(seller))
+            .map(|summary| summary.total);
+        record.high_value_seller = record
+            .seller_total
+            .is_some_and(|total| mode.qualifies(total));
     }
 
-    let report = render_report(folder, &records, &summaries, mode);
-    fs::write(&output, report.as_bytes())
-        .with_context(|| format!("无法写入报告：{}", output.display()))?;
-
-    let success_count = records.iter().filter(|record| record.is_success()).count();
-    let failed_count = records.len() - success_count;
-    let qualified_count = summaries
-        .values()
-        .filter(|summary| mode.qualifies(summary.total))
-        .count();
+    let output = match mode {
+        ProcessingMode::FullValidationExport => export::export_full(
+            folder,
+            output,
+            &mut records,
+            &summaries,
+            mode,
+            max_files_per_folder,
+        )?,
+        ProcessingMode::QuickSummary => {
+            export::export_quick(folder, output, &records, &summaries, mode)?
+        }
+    };
 
     Ok(ProcessResult {
         output,
         pdf_count: records.len(),
-        success_count,
-        failed_count,
-        qualified_count,
+        success_count: records
+            .iter()
+            .filter(|record| record.state == RecordState::Valid)
+            .count(),
+        failed_count: records
+            .iter()
+            .filter(|record| record.state == RecordState::Invalid)
+            .count(),
+        skipped_count: records
+            .iter()
+            .filter(|record| record.state == RecordState::NonInvoice)
+            .count(),
+        qualified_count: summaries
+            .values()
+            .filter(|summary| mode.qualifies(summary.total))
+            .count(),
     })
+}
+
+fn process_pdfs<F>(
+    folder: &Path,
+    pdf_files: &[PathBuf],
+    mode: ProcessingMode,
+    on_progress: &mut F,
+) -> Vec<InvoiceRecord>
+where
+    F: FnMut(ProgressUpdate),
+{
+    let total = pdf_files.len();
+    let worker_count = parallel_worker_count(total);
+    let next_index = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    let mut records = (0..total).map(|_| None).collect::<Vec<_>>();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_index = &next_index;
+            scope.spawn(move || loop {
+                let index = next_index.fetch_add(1, Ordering::Relaxed);
+                let Some(path) = pdf_files.get(index) else {
+                    break;
+                };
+
+                let file_name = display_file_name(path);
+                let record = process_pdf(folder, path, mode);
+                if sender.send((index, file_name, record)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+
+        for (completed, (index, file_name, record)) in receiver.into_iter().enumerate() {
+            records[index] = Some(record);
+            on_progress(ProgressUpdate {
+                current: completed + 1,
+                total,
+                file_name,
+            });
+        }
+    });
+
+    records
+        .into_iter()
+        .map(|record| record.expect("每份 PDF 都应由并行 worker 返回结果"))
+        .collect()
+}
+
+fn parallel_worker_count(file_count: usize) -> usize {
+    if file_count == 0 {
+        return 0;
+    }
+
+    thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_PARALLEL_PDFS)
+        .min(file_count)
+        .max(1)
 }
 
 fn find_pdf_files(folder: &Path) -> Result<Vec<PathBuf>> {
@@ -167,325 +164,203 @@ fn find_pdf_files(folder: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn process_pdf(path: &Path) -> InvoiceRecord {
+fn process_pdf(source_root: &Path, path: &Path, mode: ProcessingMode) -> InvoiceRecord {
     let file_name = display_file_name(path);
-    let text = match pdf_extract::extract_text(path) {
-        Ok(text) if !text.trim().is_empty() => text,
-        Ok(_) => {
-            return InvoiceRecord {
-                file_name,
-                seller: None,
-                total: None,
-                errors: vec!["PDF 没有可提取的文字层，可能是扫描图片".to_owned()],
+    let source_relative = path.strip_prefix(source_root).unwrap_or(path).to_path_buf();
+    let sha256 = parser::file_sha256(path).unwrap_or_default();
+    let submitter = parser::extract_submitter(&file_name);
+
+    match parser::extract_isolated(path) {
+        Ok(raw) => validate_record(
+            path.to_path_buf(),
+            source_relative,
+            file_name,
+            sha256,
+            submitter,
+            raw,
+            mode,
+        ),
+        Err(reason) => {
+            // 用户确认发票文件名应包含可识别的“姓名 + 物品 + 金额”。若正文解析
+            // 失败且文件名也完全不符合该规则，则归入非发票 PDF；疑似发票仍进入
+            // 解析失败目录，避免把真正有问题的发票藏进普通资料中。
+            let resembles_invoice_name = submitter.is_some() || file_name.contains("发票");
+            let (state, kind, reason) = if resembles_invoice_name {
+                (RecordState::Invalid, IssueKind::ParseFailure, reason)
+            } else {
+                (
+                    RecordState::NonInvoice,
+                    IssueKind::Other,
+                    format!(
+                        "正文解析失败，且文件名不符合已确认的发票命名规则，按非发票 PDF 分流：{reason}"
+                    ),
+                )
             };
-        }
-        Err(error) => {
-            return InvoiceRecord {
+            InvoiceRecord {
+                source_path: path.to_path_buf(),
+                source_relative,
                 file_name,
-                seller: None,
-                total: None,
-                errors: vec![format!("无法读取 PDF 文字：{error}")],
-            };
+                sha256,
+                submitter,
+                raw: RawInvoiceData::default(),
+                state,
+                issues: vec![ValidationIssue { kind, reason }],
+                seller_total: None,
+                high_value_seller: false,
+                export_relative: None,
+            }
         }
-    };
-
-    let seller_result = extract_seller(&text);
-    let total_result = extract_total(&text);
-    let mut errors = Vec::new();
-
-    let seller = match seller_result {
-        Ok(value) => Some(value),
-        Err(error) => {
-            errors.push(format!("销售方名称提取失败：{error}"));
-            None
-        }
-    };
-    let total = match total_result {
-        Ok(value) => Some(value),
-        Err(error) => {
-            errors.push(format!("价税合计提取失败：{error}"));
-            None
-        }
-    };
-
-    InvoiceRecord {
-        file_name,
-        seller,
-        total,
-        errors,
     }
 }
 
-fn normalized_lines(text: &str) -> Vec<String> {
-    text.replace('\r', "\n")
-        .replace(['\u{00a0}', '\u{3000}'], " ")
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(collapse_whitespace)
-        .collect()
+#[allow(clippy::too_many_arguments)]
+fn validate_record(
+    source_path: PathBuf,
+    source_relative: PathBuf,
+    file_name: String,
+    sha256: String,
+    submitter: Option<String>,
+    raw: RawInvoiceData,
+    mode: ProcessingMode,
+) -> InvoiceRecord {
+    let resembles_invoice = submitter.is_some() || invoice_signal_count(&raw) >= 2;
+    if !raw.is_invoice && !resembles_invoice {
+        return InvoiceRecord {
+            source_path,
+            source_relative,
+            file_name,
+            sha256,
+            submitter,
+            raw,
+            state: RecordState::NonInvoice,
+            issues: vec![ValidationIssue {
+                kind: IssueKind::Other,
+                reason: "未检测到足够的发票版式和关键字段".to_owned(),
+            }],
+            seller_total: None,
+            high_value_seller: false,
+            export_relative: None,
+        };
+    }
+
+    let mut issues = Vec::new();
+    if raw.is_red {
+        issues.push(ValidationIssue {
+            kind: IssueKind::RedInvoice,
+            reason: "检测到红字、红冲或负数金额特征".to_owned(),
+        });
+    }
+
+    if mode == ProcessingMode::FullValidationExport {
+        match raw.buyer_name.as_deref() {
+            Some(name) if normalized(name) == normalized(EXPECTED_BUYER_NAME) => {}
+            Some(name) => issues.push(ValidationIssue {
+                kind: IssueKind::BuyerNameMismatch,
+                reason: format!("购买方名称为“{name}”，应为“{EXPECTED_BUYER_NAME}”"),
+            }),
+            None => issues.push(missing("购买方名称")),
+        }
+
+        match raw.buyer_tax_id.as_deref() {
+            Some(tax_id) if normalized_tax_id(tax_id) == EXPECTED_BUYER_TAX_ID => {}
+            Some(tax_id) => issues.push(ValidationIssue {
+                kind: IssueKind::BuyerTaxIdMismatch,
+                reason: format!("购买方税号为“{tax_id}”，应为“{EXPECTED_BUYER_TAX_ID}”"),
+            }),
+            None => issues.push(missing("购买方税号")),
+        }
+
+        if submitter.is_none() {
+            issues.push(ValidationIssue {
+                kind: IssueKind::SubmitterUnknown,
+                reason: "无法按“姓名 + 物品 + 金额”的文件名规则可靠识别提交人".to_owned(),
+            });
+        }
+        if !raw.pdf_risks.is_empty() {
+            issues.push(ValidationIssue {
+                kind: IssueKind::SuspiciousPdf,
+                reason: raw.pdf_risks.join("；"),
+            });
+        }
+        if raw.invoice_number.is_none() {
+            issues.push(missing("发票号码"));
+        }
+        if raw.invoice_date.is_none() {
+            issues.push(missing("开票日期"));
+        }
+        if raw.seller_tax_id.is_none() {
+            issues.push(missing("销售方税号"));
+        }
+    }
+
+    if raw.seller_name.is_none() {
+        issues.push(missing("销售方名称"));
+    }
+    if raw.total.is_none() {
+        issues.push(missing("价税合计"));
+    }
+
+    InvoiceRecord {
+        source_path,
+        source_relative,
+        file_name,
+        sha256,
+        submitter,
+        raw,
+        state: if issues.is_empty() {
+            RecordState::Valid
+        } else {
+            RecordState::Invalid
+        },
+        issues,
+        seller_total: None,
+        high_value_seller: false,
+        export_relative: None,
+    }
 }
 
-fn collapse_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+fn invoice_signal_count(raw: &RawInvoiceData) -> usize {
+    usize::from(raw.invoice_number.is_some())
+        + usize::from(raw.invoice_date.is_some())
+        + usize::from(raw.buyer_name.is_some() || raw.buyer_tax_id.is_some())
+        + usize::from(raw.seller_name.is_some() || raw.seller_tax_id.is_some())
+        + usize::from(raw.total.is_some())
+        + usize::from(!raw.goods.is_empty())
 }
 
-fn compact(value: &str) -> String {
+fn missing(field: &str) -> ValidationIssue {
+    ValidationIssue {
+        kind: IssueKind::MissingField,
+        reason: format!("未能可靠提取{field}"),
+    }
+}
+
+fn normalized(value: &str) -> String {
     value
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect()
 }
 
-fn extract_seller(text: &str) -> Result<String> {
-    let lines = normalized_lines(text);
-    let first_money_line = lines
+fn normalized_tax_id(value: &str) -> String {
+    normalized(value).to_ascii_uppercase()
+}
+
+fn summarize(records: &[InvoiceRecord]) -> SellerSummaries {
+    let mut summaries = SellerSummaries::new();
+    for record in records
         .iter()
-        .position(|line| line.contains('¥') || line.contains('￥'))
-        .unwrap_or(lines.len());
-    let tax_id = Regex::new(r"^(?:[0-9A-Z]{18}|[0-9]{15})$").expect("valid tax id regex");
-    let tax_id_lines = lines
-        .iter()
-        .enumerate()
-        .take(first_money_line)
-        .filter_map(|(index, line)| tax_id.is_match(&compact(line)).then_some(index))
-        .collect::<Vec<_>>();
-
-    let seller_tax_id_line = tax_id_lines
-        .last()
-        .copied()
-        .ok_or_else(|| anyhow!("未找到销售方纳税人识别号，无法可靠定位名称"))?;
-
-    for line in lines[..seller_tax_id_line].iter().rev().take(6) {
-        if is_possible_seller_name(line) {
-            return Ok(line.trim().to_owned());
-        }
-    }
-
-    bail!("已找到销售方纳税人识别号，但其前方没有可信的名称")
-}
-
-fn is_possible_seller_name(line: &str) -> bool {
-    let compacted = compact(line);
-    let has_cjk = compacted
-        .chars()
-        .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character));
-    let forbidden = [
-        "名称",
-        "统一社会信用代码",
-        "纳税人识别号",
-        "发票号码",
-        "开票日期",
-        "购买方",
-        "销售方",
-        "信息",
-        "电子发票",
-        "项目名称",
-        "规格型号",
-        "价税合计",
-    ];
-
-    has_cjk
-        && (2..=100).contains(&compacted.chars().count())
-        && !forbidden.iter().any(|word| compacted.contains(word))
-        && !compacted.contains('¥')
-        && !compacted.contains('￥')
-        && !compacted
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
-}
-
-fn extract_total(text: &str) -> Result<Decimal> {
-    let currency = Regex::new(r"[¥￥]\s*([0-9][0-9,]*\.[0-9]{2})").expect("valid currency regex");
-    let amounts = currency
-        .captures_iter(text)
-        .filter_map(|capture| {
-            let matched = capture.get(1)?;
-            parse_amount(matched.as_str())
-                .ok()
-                .map(|amount| (matched.start(), amount))
-        })
-        .collect::<Vec<_>>();
-
-    if amounts.is_empty() {
-        bail!("未找到带 ¥ 或 ￥ 符号且保留两位小数的金额")
-    }
-
-    for window in amounts.windows(3) {
-        if window[0].1 + window[1].1 == window[2].1 {
-            return Ok(window[2].1);
-        }
-    }
-
-    let uppercase_money =
-        Regex::new(r"[零〇一二三四五六七八九壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元角分]+(?:整|正)")
-            .expect("valid uppercase money regex");
-    if let Some(anchor) = uppercase_money.find(text) {
-        if let Some((_, amount)) = amounts
-            .iter()
-            .find(|(position, _)| *position >= anchor.end())
-        {
-            return Ok(*amount);
-        }
-    }
-
-    if amounts.len() == 1 {
-        return Ok(amounts[0].1);
-    }
-
-    bail!("找到多个金额，但无法通过合计等式或大写金额位置确认价税合计")
-}
-
-fn parse_amount(value: &str) -> Result<Decimal> {
-    let cleaned = value.replace(',', "");
-    Decimal::from_str(&cleaned).with_context(|| format!("无效金额：{value}"))
-}
-
-fn summarize(records: &[InvoiceRecord]) -> BTreeMap<String, SellerSummary> {
-    let mut summaries = BTreeMap::<String, SellerSummary>::new();
-
-    for record in records.iter().filter(|record| record.is_success()) {
-        let seller = record
-            .seller
-            .as_ref()
-            .expect("successful record has seller");
-        let total = record.total.expect("successful record has total");
+        .filter(|record| record.state == RecordState::Valid)
+    {
+        let (Some(seller), Some(total)) = (&record.raw.seller_name, record.raw.total) else {
+            continue;
+        };
         let summary = summaries.entry(seller.clone()).or_default();
         summary.count += 1;
         summary.total += total;
         summary.files.push(record.file_name.clone());
     }
-
     summaries
-}
-
-fn render_report(
-    source_folder: &Path,
-    records: &[InvoiceRecord],
-    summaries: &BTreeMap<String, SellerSummary>,
-    mode: ProcessingMode,
-) -> String {
-    let generated_at = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let success_count = records.iter().filter(|record| record.is_success()).count();
-    let failed_count = records.len() - success_count;
-    let mut output = String::new();
-
-    output.push_str("# 发票提取报告\n\n");
-    output.push_str(&format!("- 生成时间：{generated_at}\n"));
-    output.push_str(&format!("- 来源目录：`{}`\n", source_folder.display()));
-    output.push_str(&format!("- 处理模式：{}\n", mode.label()));
-    output.push_str(&format!("- PDF 数量：{}\n", records.len()));
-    output.push_str(&format!("- 成功：{success_count}\n"));
-    output.push_str(&format!("- 失败：{failed_count}\n\n"));
-
-    output.push_str("## 发票明细\n\n");
-    output.push_str("| 序号 | 文件名 | 销售方名称 | 价税合计（元） | 状态 |\n");
-    output.push_str("| ---: | --- | --- | ---: | --- |\n");
-    for (index, record) in records.iter().enumerate() {
-        let seller = record.seller.as_deref().unwrap_or("—");
-        let total = record
-            .total
-            .map(format_money)
-            .unwrap_or_else(|| "—".to_owned());
-        let status = if record.is_success() {
-            "成功".to_owned()
-        } else {
-            format!("失败：{}", record.errors.join("；"))
-        };
-        output.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
-            index + 1,
-            markdown_cell(&record.file_name),
-            markdown_cell(seller),
-            total,
-            markdown_cell(&status)
-        ));
-    }
-
-    output.push_str("\n## 销售方汇总\n\n");
-    if summaries.is_empty() {
-        output.push_str("没有可用于汇总的有效记录。\n");
-    } else {
-        output.push_str("| 销售方名称 | 发票数量 | 合计金额（元） | 是否符合当前模式 |\n");
-        output.push_str("| --- | ---: | ---: | --- |\n");
-        for (seller, summary) in summaries {
-            let qualified = if mode.qualifies(summary.total) {
-                "是"
-            } else {
-                "否"
-            };
-            output.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
-                markdown_cell(seller),
-                summary.count,
-                format_money(summary.total),
-                qualified
-            ));
-        }
-    }
-
-    output.push_str(&format!("\n## {}\n\n", mode.label()));
-    let qualified = summaries
-        .iter()
-        .filter(|(_, summary)| mode.qualifies(summary.total))
-        .collect::<Vec<_>>();
-    if qualified.is_empty() {
-        output.push_str("没有符合条件的销售方。\n");
-    } else {
-        for (seller, summary) in qualified {
-            output.push_str(&format!(
-                "- **{}**：{} 张发票，合计 **{} 元**\n",
-                markdown_inline(seller),
-                summary.count,
-                format_money(summary.total)
-            ));
-            for file in &summary.files {
-                output.push_str(&format!("  - `{}`\n", markdown_code(file)));
-            }
-        }
-    }
-
-    output.push_str("\n## 提取失败的文件\n\n");
-    let failed = records
-        .iter()
-        .filter(|record| !record.is_success())
-        .collect::<Vec<_>>();
-    if failed.is_empty() {
-        output.push_str("无。\n");
-    } else {
-        for record in failed {
-            output.push_str(&format!(
-                "- `{}`：{}\n",
-                markdown_code(&record.file_name),
-                markdown_inline(&record.errors.join("；"))
-            ));
-        }
-    }
-
-    output.push_str("\n## 给 AI 的固定提示词\n\n");
-    output.push_str("> ");
-    output.push_str(mode.ai_prompt());
-    output.push('\n');
-    output
-}
-
-fn format_money(value: Decimal) -> String {
-    format!("{:.2}", value)
-}
-
-fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace(['\r', '\n'], " ")
-}
-
-fn markdown_inline(value: &str) -> String {
-    value
-        .replace('*', "\\*")
-        .replace('_', "\\_")
-        .replace(['\r', '\n'], " ")
-}
-
-fn markdown_code(value: &str) -> String {
-    value.replace('`', "'").replace(['\r', '\n'], " ")
 }
 
 fn display_file_name(path: &Path) -> String {
@@ -494,66 +369,88 @@ fn display_file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn unique_default_output(folder: &Path) -> PathBuf {
-    let timestamp = Local::now().format("%Y-%m-%d_%H%M%S");
-    let base = format!("发票汇总_{timestamp}");
-    let first = folder.join(format!("{base}.md"));
-    if !first.exists() {
-        return first;
-    }
-
-    for suffix in 1..10_000 {
-        let candidate = folder.join(format!("{base}_{suffix}.md"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-
-    folder.join(format!("{base}_{}.md", Local::now().timestamp_millis()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE_TEXT: &str = r#"
-电子发票（普通发票）
-发票号码：26442000004577882986
-名称：
-名称：
-示例大学
-12345678901234567X
-轮趣科技（东莞）有限公司
-91310110MA1G8ABCDX
-¥32.65
-¥4.25
-叁拾陆圆玖角整
-¥36.90
-"#;
+    use rust_decimal::Decimal;
 
     #[test]
-    fn extracts_seller_name_from_last_tax_id() {
+    fn threshold_is_inclusive() {
+        let mode = ProcessingMode::FullValidationExport;
+        assert!(mode.qualifies(Decimal::new(100_000, 2)));
+        assert!(!mode.qualifies(Decimal::new(99_999, 2)));
+    }
+
+    #[test]
+    fn parallel_worker_count_is_safe_and_bounded() {
+        assert_eq!(parallel_worker_count(0), 0);
+        assert_eq!(parallel_worker_count(1), 1);
+
+        let workers = parallel_worker_count(usize::MAX);
+        assert!((1..=MAX_PARALLEL_PDFS).contains(&workers));
+    }
+
+    #[test]
+    fn tax_id_comparison_ignores_case_and_spaces() {
         assert_eq!(
-            extract_seller(SAMPLE_TEXT).unwrap(),
-            "轮趣科技（东莞）有限公司"
+            normalized_tax_id("12440000455860226 x"),
+            EXPECTED_BUYER_TAX_ID
         );
     }
 
     #[test]
-    fn extracts_tax_inclusive_total_using_equation() {
-        assert_eq!(extract_total(SAMPLE_TEXT).unwrap(), Decimal::new(3690, 2));
+    fn image_pdf_with_invoice_filename_is_suspicious_not_non_invoice() {
+        let raw = RawInvoiceData {
+            pdf_risks: vec!["无文本层，疑似扫描件或图片转换 PDF".to_owned()],
+            ..RawInvoiceData::default()
+        };
+        let record = validate_record(
+            PathBuf::from("张三-电机-10.pdf"),
+            PathBuf::from("张三-电机-10.pdf"),
+            "张三-电机-10.pdf".to_owned(),
+            String::new(),
+            Some("张三".to_owned()),
+            raw,
+            ProcessingMode::FullValidationExport,
+        );
+        assert_eq!(record.state, RecordState::Invalid);
+        assert_eq!(
+            record.primary_issue().map(|issue| issue.kind),
+            Some(IssueKind::SuspiciousPdf)
+        );
     }
 
     #[test]
-    fn uses_amount_after_uppercase_money_as_fallback() {
-        let text = "价税合计（大写） 壹佰圆整 （小写） ￥100.00";
-        assert_eq!(extract_total(text).unwrap(), Decimal::new(10000, 2));
+    fn partial_invoice_fields_are_not_classified_as_non_invoice() {
+        let raw = RawInvoiceData {
+            invoice_date: Some("2026-04-08".to_owned()),
+            total: Some(Decimal::new(1480, 2)),
+            goods: vec!["*集成电路*电子元器件".to_owned()],
+            ..RawInvoiceData::default()
+        };
+        let record = validate_record(
+            PathBuf::from("张三-芯片-14.8元.pdf"),
+            PathBuf::from("张三-芯片-14.8元.pdf"),
+            "张三-芯片-14.8元.pdf".to_owned(),
+            String::new(),
+            Some("张三".to_owned()),
+            raw,
+            ProcessingMode::FullValidationExport,
+        );
+        assert_eq!(record.state, RecordState::Invalid);
     }
 
     #[test]
-    fn threshold_is_inclusive() {
-        let mode = ProcessingMode::SellerTotalAtLeast1000;
-        assert!(mode.qualifies(Decimal::new(100000, 2)));
-        assert!(!mode.qualifies(Decimal::new(99999, 2)));
+    fn document_without_filename_or_content_signals_is_non_invoice() {
+        let record = validate_record(
+            PathBuf::from("课程说明.pdf"),
+            PathBuf::from("课程说明.pdf"),
+            "课程说明.pdf".to_owned(),
+            String::new(),
+            None,
+            RawInvoiceData::default(),
+            ProcessingMode::FullValidationExport,
+        );
+        assert_eq!(record.state, RecordState::NonInvoice);
     }
 }
