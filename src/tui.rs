@@ -1,6 +1,6 @@
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor;
@@ -17,6 +17,7 @@ use rfd::FileDialog;
 
 use crate::invoice::process_folder;
 use crate::model::{ProcessResult, ProcessingMode, ProgressUpdate, DEFAULT_MAX_FILES_PER_FOLDER};
+use crate::runtime_log;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -41,20 +42,48 @@ pub fn run() -> Result<()> {
             max_files_per_folder,
         } = setup_screen(&mut terminal, remembered_batch_limit)?
         else {
+            runtime_log::info("程序退出 | interface=tui | reason=user_quit");
             return Ok(());
         };
         remembered_batch_limit = max_files_per_folder;
+        let started = Instant::now();
+        runtime_log::info(format!(
+            "开始处理 | interface=tui | mode={} | source={} | batch_limit={}",
+            mode.label(),
+            source_folder.display(),
+            max_files_per_folder
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "unlimited".to_owned())
+        ));
 
         match process_with_progress(&mut terminal, &source_folder, mode, max_files_per_folder) {
             Ok(result) => {
+                runtime_log::info(format!(
+                    "处理完成 | interface=tui | elapsed_ms={} | pdf={} | valid={} | review={} | non_invoice={} | qualified_sellers={} | output={}",
+                    started.elapsed().as_millis(),
+                    result.pdf_count,
+                    result.success_count,
+                    result.failed_count,
+                    result.skipped_count,
+                    result.qualified_count,
+                    result.output.display()
+                ));
                 drain_pending_events()?;
                 if completion_screen(&mut terminal, &result)? == NextAction::Exit {
+                    runtime_log::info("程序退出 | interface=tui | reason=completed");
                     return Ok(());
                 }
             }
             Err(error) => {
+                runtime_log::error(format!(
+                    "处理失败 | interface=tui | elapsed_ms={} | mode={} | source={} | error={error:#}",
+                    started.elapsed().as_millis(),
+                    mode.label(),
+                    source_folder.display()
+                ));
                 drain_pending_events()?;
                 if error_screen(&mut terminal, &format!("{error:#}"))? == NextAction::Exit {
+                    runtime_log::info("程序退出 | interface=tui | reason=error_screen");
                     return Ok(());
                 }
             }
@@ -152,6 +181,9 @@ fn setup_screen(
                 batch_limit_input = Some(String::new());
                 notice = "输入每个发票文件夹的上限；0 表示不限制".to_owned();
             }
+            KeyCode::Char('l' | 'L') => {
+                notice = export_log_notice(terminal)?;
+            }
             KeyCode::Char('f' | 'F' | 'o' | 'O') => {
                 if let Some(folder) = pick_source_folder(terminal)? {
                     notice = "目录已选择；按 Enter 开始处理".to_owned();
@@ -190,7 +222,31 @@ fn pick_source_folder(terminal: &mut TerminalSession) -> Result<Option<PathBuf>>
         .set_title("请选择 PDF 发票所在文件夹")
         .pick_folder();
     terminal.resume()?;
+    drain_dialog_events()?;
     Ok(selected)
+}
+
+fn export_log_notice(terminal: &mut TerminalSession) -> Result<String> {
+    terminal.suspend()?;
+    let selected = FileDialog::new()
+        .set_title("请选择运行日志的保存位置")
+        .set_file_name(runtime_log::suggested_file_name())
+        .add_filter("运行日志", &["log", "txt"])
+        .save_file();
+    terminal.resume()?;
+    drain_dialog_events()?;
+
+    let Some(path) = selected else {
+        return Ok("已取消导出；关闭程序不会保存运行日志".to_owned());
+    };
+    runtime_log::info(format!("用户选择导出运行日志 | path={}", path.display()));
+    match runtime_log::export(&path) {
+        Ok(()) => Ok(format!("运行日志已导出：{}", path.display())),
+        Err(error) => {
+            runtime_log::error(format!("导出运行日志失败 | error={error:#}"));
+            Ok(format!("运行日志导出失败：{error:#}"))
+        }
+    }
 }
 
 fn process_with_progress(
@@ -235,13 +291,15 @@ fn process_with_progress(
 }
 
 fn completion_screen(terminal: &mut TerminalSession, result: &ProcessResult) -> Result<NextAction> {
+    let mut notice = "按 L 可选择位置导出运行日志；直接退出不会保存".to_owned();
     loop {
         terminal
             .terminal
-            .draw(|frame| render_completion(frame, result))
+            .draw(|frame| render_completion(frame, result, &notice))
             .context("无法绘制 TUI 完成界面")?;
 
         match read_key()? {
+            KeyCode::Char('l' | 'L') => notice = export_log_notice(terminal)?,
             KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
                 return Ok(NextAction::Exit);
@@ -252,13 +310,15 @@ fn completion_screen(terminal: &mut TerminalSession, result: &ProcessResult) -> 
 }
 
 fn error_screen(terminal: &mut TerminalSession, message: &str) -> Result<NextAction> {
+    let mut notice = "按 L 可选择位置导出运行日志；直接退出不会保存".to_owned();
     loop {
         terminal
             .terminal
-            .draw(|frame| render_error(frame, message))
+            .draw(|frame| render_error(frame, message, &notice))
             .context("无法绘制 TUI 错误界面")?;
 
         match read_key()? {
+            KeyCode::Char('l' | 'L') => notice = export_log_notice(terminal)?,
             KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
                 return Ok(NextAction::Exit);
@@ -456,13 +516,14 @@ fn render_progress(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_completion(frame: &mut Frame, result: &ProcessResult) {
+fn render_completion(frame: &mut Frame, result: &ProcessResult, notice: &str) {
     frame.render_widget(Clear, frame.area());
     let area = centered_content(frame.area());
     let output = truncate_middle(
         &result.output.display().to_string(),
         area.width.saturating_sub(4) as usize,
     );
+    let notice = truncate_middle(notice, area.width.saturating_sub(4) as usize);
 
     let lines = vec![
         Line::from(vec![
@@ -500,17 +561,27 @@ fn render_completion(frame: &mut Frame, result: &ProcessResult) {
             format!("  {output}"),
             Style::default().fg(TEXT),
         )),
+        Line::default(),
+        Line::from(Span::styled(
+            format!("  {notice}"),
+            log_notice_style(&notice),
+        )),
         divider(area.width),
-        key_hints(&[("Enter", "退出"), ("R", "再处理一个目录")]),
+        key_hints(&[
+            ("Enter", "退出"),
+            ("L", "导出日志"),
+            ("R", "再处理一个目录"),
+        ]),
     ];
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_error(frame: &mut Frame, message: &str) {
+fn render_error(frame: &mut Frame, message: &str, notice: &str) {
     frame.render_widget(Clear, frame.area());
     let area = centered_content(frame.area());
     let message = truncate_middle(message, area.width.saturating_sub(4) as usize * 3);
+    let notice = truncate_middle(notice, area.width.saturating_sub(4) as usize);
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -527,8 +598,13 @@ fn render_error(frame: &mut Frame, message: &str) {
             format!("  {message}"),
             Style::default().fg(ERROR),
         )),
+        Line::default(),
+        Line::from(Span::styled(
+            format!("  {notice}"),
+            log_notice_style(&notice),
+        )),
         divider(area.width),
-        key_hints(&[("R", "返回重新选择"), ("Enter", "退出")]),
+        key_hints(&[("L", "导出日志"), ("R", "返回重新选择"), ("Enter", "退出")]),
     ];
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -559,11 +635,12 @@ fn subtitle_line() -> Line<'static> {
 }
 
 fn setup_footer(width: u16) -> Line<'static> {
-    if width < 68 {
+    if width < 82 {
         key_hints(&[
             ("Enter", "开始"),
             ("↑↓", "模式"),
             ("M", "分批"),
+            ("L", "日志"),
             ("Q", "退出"),
         ])
     } else {
@@ -572,8 +649,19 @@ fn setup_footer(width: u16) -> Line<'static> {
             ("↑↓", "模式"),
             ("M", "分批上限"),
             ("F", "选择目录"),
+            ("L", "导出日志"),
             ("Q", "退出"),
         ])
+    }
+}
+
+fn log_notice_style(notice: &str) -> Style {
+    if notice.contains("失败") {
+        Style::default().fg(ERROR)
+    } else if notice.contains("已导出") {
+        Style::default().fg(SUCCESS)
+    } else {
+        Style::default().fg(SUBTLE)
     }
 }
 
@@ -688,6 +776,14 @@ fn read_key() -> Result<KeyCode> {
 fn drain_pending_events() -> Result<()> {
     while event::poll(Duration::ZERO).context("无法检查终端输入")? {
         let _ = event::read().context("无法清理终端输入")?;
+    }
+    Ok(())
+}
+
+fn drain_dialog_events() -> Result<()> {
+    const QUIET_PERIOD: Duration = Duration::from_millis(150);
+    while event::poll(QUIET_PERIOD).context("无法等待原生窗口按键释放")? {
+        let _ = event::read().context("无法清理原生窗口残留输入")?;
     }
     Ok(())
 }

@@ -2,6 +2,7 @@ mod export;
 mod invoice;
 mod model;
 mod parser;
+mod runtime_log;
 mod tui;
 
 use std::path::PathBuf;
@@ -64,6 +65,7 @@ fn main() {
         return;
     }
 
+    runtime_log::start_session();
     if let Err(error) = tui::run() {
         eprintln!("\n错误：{error:#}");
         tui::pause_before_exit();
