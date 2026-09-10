@@ -16,7 +16,9 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use rfd::FileDialog;
 
 use crate::invoice::process_folder;
-use crate::model::{ProcessResult, ProcessingMode, ProgressUpdate, DEFAULT_MAX_FILES_PER_FOLDER};
+use crate::model::{
+    ProcessResult, ProcessingMode, ProgressUpdate, APP_VERSION, DEFAULT_MAX_FILES_PER_FOLDER,
+};
 use crate::runtime_log;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -621,7 +623,7 @@ fn brand_line(page: &str) -> Line<'static> {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  v{}  ·  {page}", env!("CARGO_PKG_VERSION")),
+            format!("  v{APP_VERSION}  ·  {page}"),
             Style::default().fg(MUTED),
         ),
     ])

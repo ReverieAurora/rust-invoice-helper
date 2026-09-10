@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -12,6 +13,7 @@ use crate::model::{
     RecordState, SellerSummaries, ValidationIssue, EXPECTED_BUYER_NAME, EXPECTED_BUYER_TAX_ID,
 };
 use crate::parser;
+use crate::runtime_log;
 
 const MAX_PARALLEL_PDFS: usize = 8;
 
@@ -96,6 +98,9 @@ where
 {
     let total = pdf_files.len();
     let worker_count = parallel_worker_count(total);
+    runtime_log::info(format!(
+        "批处理调度 | pdf_total={total} | parallel_workers={worker_count}"
+    ));
     let next_index = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
     let mut records = (0..total).map(|_| None).collect::<Vec<_>>();
@@ -111,15 +116,19 @@ where
                 };
 
                 let file_name = display_file_name(path);
+                let started = Instant::now();
                 let record = process_pdf(folder, path, mode);
-                if sender.send((index, file_name, record)).is_err() {
+                let elapsed_ms = started.elapsed().as_millis();
+                if sender.send((index, file_name, elapsed_ms, record)).is_err() {
                     break;
                 }
             });
         }
         drop(sender);
 
-        for (completed, (index, file_name, record)) in receiver.into_iter().enumerate() {
+        for (completed, (index, file_name, elapsed_ms, record)) in receiver.into_iter().enumerate()
+        {
+            runtime_log::file_result(completed + 1, total, elapsed_ms, &record);
             records[index] = Some(record);
             on_progress(ProgressUpdate {
                 current: completed + 1,

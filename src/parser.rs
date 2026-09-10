@@ -153,38 +153,35 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 
 pub fn extract_submitter(file_name: &str) -> Option<String> {
     let stem = Path::new(file_name).file_stem()?.to_string_lossy();
+    let copy_suffix =
+        Regex::new(r"(?:\s*[（(]\d+[）)])+$").expect("valid filename copy suffix regex");
+    let stem = copy_suffix.replace(stem.trim(), "");
+    let amount_at_end = Regex::new(r"[¥￥]?\d[\d,]*(?:\.\d{1,2})?(?:元|圆)?$")
+        .expect("valid filename trailing amount regex");
+    if !amount_at_end.is_match(stem.trim()) {
+        return None;
+    }
+
     let separator = Regex::new(r"[\s_\-—–+]+").expect("valid filename separator regex");
     let parts = separator
         .split(stem.trim())
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>();
-    let amount =
-        Regex::new(r"^[¥￥]?\d+(?:\.\d{1,2})?(?:元|圆)?$").expect("valid filename amount regex");
-    let has_trailing_amount = parts
-        .iter()
-        .skip(1)
-        .rev()
-        .any(|part| amount.is_match(&part.trim().replace(',', "")));
-    if !has_trailing_amount {
-        // 无分隔符时只接受“2～4 个中文姓名字符后直接接英文/数字”的
-        // 明确边界，例如“欧阳兆祺MicroHDMI线23.9元”。全中文连写仍不猜测。
-        let compact_amount = Regex::new(r"[¥￥]?\d+(?:\.\d{1,2})?(?:元|圆)?$")
-            .expect("valid compact filename amount regex");
-        let name_before_ascii =
-            Regex::new(r"^([\p{Han}·]{2,4})[A-Za-z0-9]").expect("valid compact submitter regex");
-        if compact_amount.is_match(stem.trim()) {
-            let candidate = name_before_ascii.captures(stem.trim())?.get(1)?.as_str();
-            return valid_submitter(candidate).then(|| candidate.to_owned());
-        }
-        return None;
-    }
-
-    let candidate = parts[0].trim_matches(|character: char| {
+    let candidate = parts.first()?.trim_matches(|character: char| {
         matches!(
             character,
             '“' | '”' | '‘' | '’' | '"' | '\'' | '(' | ')' | '（' | '）'
         )
     });
+    if valid_submitter(candidate) {
+        return Some(candidate.to_owned());
+    }
+
+    // 无姓名分隔符时只接受“2～4 个中文姓名字符后直接接英文/数字”的
+    // 明确边界，例如“林滔tps40345 34.00元”。全中文连写仍不猜测。
+    let name_before_ascii =
+        Regex::new(r"^([\p{Han}·]{2,4})[A-Za-z0-9]").expect("valid compact submitter regex");
+    let candidate = name_before_ascii.captures(stem.trim())?.get(1)?.as_str();
     valid_submitter(candidate).then(|| candidate.to_owned())
 }
 
@@ -214,7 +211,7 @@ fn parse_pdf_text(text: &str, bytes: &[u8]) -> RawInvoiceData {
     } else {
         buyer_tax_id
             .as_deref()
-            .and_then(|buyer_tax_id| tax_id_after(&compacted, buyer_tax_id))
+            .and_then(|buyer_tax_id| seller_tax_id_near_buyer(&compacted, buyer_tax_id))
     };
     let buyer_name = tax_entries
         .first()
@@ -223,7 +220,8 @@ fn parse_pdf_text(text: &str, bytes: &[u8]) -> RawInvoiceData {
             compacted
                 .contains(crate::model::EXPECTED_BUYER_NAME)
                 .then(|| crate::model::EXPECTED_BUYER_NAME.to_owned())
-        });
+        })
+        .map(|name| normalize_party_name(&name));
     let seller_name = (tax_entries.len() >= 2)
         .then(|| {
             tax_entries
@@ -235,7 +233,9 @@ fn parse_pdf_text(text: &str, bytes: &[u8]) -> RawInvoiceData {
             buyer_tax_id.as_deref().and_then(|buyer_tax_id| {
                 seller_between_buyer_name_and_tax_id(&compacted, buyer_tax_id)
             })
-        });
+        })
+        .or_else(|| labeled_other_party_name(&lines, buyer_name.as_deref()))
+        .map(|name| normalize_party_name(&name));
     let total = extract_total(text).ok();
     let invoice_issuer = extract_invoice_issuer(&lines, total);
     let goods = extract_goods(&lines);
@@ -281,6 +281,34 @@ fn normalized_lines(text: &str) -> Vec<String> {
 
 fn collapse_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_party_name(value: &str) -> String {
+    let chars = value.trim().chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(value.len());
+    for (index, character) in chars.iter().copied().enumerate() {
+        if !character.is_whitespace() {
+            output.push(character);
+            continue;
+        }
+
+        let previous = output.chars().next_back();
+        let next = chars[index + 1..]
+            .iter()
+            .copied()
+            .find(|candidate| !candidate.is_whitespace());
+        if previous.is_some_and(is_han) && next.is_some_and(is_han) {
+            continue;
+        }
+        if !output.ends_with(' ') {
+            output.push(' ');
+        }
+    }
+    output.trim().to_owned()
+}
+
+fn is_han(character: char) -> bool {
+    ('\u{3400}'..='\u{9fff}').contains(&character)
 }
 
 fn compact(value: &str) -> String {
@@ -345,6 +373,44 @@ fn tax_id_after(compacted: &str, buyer_tax_id: &str) -> Option<String> {
         .expect("valid seller tax id regex")
         .is_match(&candidate)
         .then_some(candidate)
+}
+
+fn seller_tax_id_near_buyer(compacted: &str, buyer_tax_id: &str) -> Option<String> {
+    tax_id_after(compacted, buyer_tax_id).or_else(|| {
+        // 少数数电票的文字层会把销售方税号和购买方税号倒序粘成一行，
+        // 例如“9144...69Y1244...226X”。购买方税号固定且已确认，
+        // 因此只接受它正前方连续18位的税号候选，避免从其他号码猜测。
+        let buyer_start = compacted.find(buyer_tax_id)?;
+        let candidate = compacted[..buyer_start]
+            .chars()
+            .rev()
+            .take(18)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        Regex::new(r"^[0-9A-Z]{18}$")
+            .expect("valid seller tax id regex")
+            .is_match(&candidate)
+            .then_some(candidate)
+    })
+}
+
+fn labeled_other_party_name(lines: &[String], buyer_name: Option<&str>) -> Option<String> {
+    let labeled_name =
+        Regex::new(r"(?:^|\s)名称[:：]\s*(.+)$").expect("valid labeled party name regex");
+    lines.iter().find_map(|line| {
+        let candidate = labeled_name
+            .captures(line)
+            .and_then(|capture| capture.get(1))
+            .map(|matched| matched.as_str().trim())?;
+        if !is_possible_name(candidate)
+            || buyer_name.is_some_and(|buyer| normalize_party_name(candidate) == buyer)
+        {
+            return None;
+        }
+        Some(candidate.to_owned())
+    })
 }
 
 fn seller_between_buyer_name_and_tax_id(compacted: &str, buyer_tax_id: &str) -> Option<String> {
@@ -719,10 +785,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_reversed_adjacent_tax_ids_and_labeled_names() {
+        let text = r#"
+电子发票（普通发票） 发票号码: 26957000000114799448
+开票日期: 2026年04月29日
+销售方信息
+价税合计(大写) 壹佰伍拾柒圆陆角捌分 (小写) ¥157.68
+购买方信息 91440300795432869Y12440000455860226X
+名称:深圳嘉立创科技集团股份有限公司
+统一社会信用代码/纳税人识别号:
+名称:广东工业大学
+统一社会信用代码/纳税人识别号:
+"#;
+        let result = parse_pdf_text(text, b"%PDF-1.7");
+
+        assert_eq!(result.buyer_name.as_deref(), Some("广东工业大学"));
+        assert_eq!(result.buyer_tax_id.as_deref(), Some("12440000455860226X"));
+        assert_eq!(
+            result.seller_name.as_deref(),
+            Some("深圳嘉立创科技集团股份有限公司")
+        );
+        assert_eq!(result.seller_tax_id.as_deref(), Some("91440300795432869Y"));
+    }
+
+    #[test]
     fn amount_in_chinese_ending_with_cents_anchors_total() {
         let total = extract_total("价税合计（大写）肆圆捌角贰分 ¥4.82\n¥4.78\n¥0.04")
             .expect("total should be parsed");
         assert_eq!(total, Decimal::new(482, 2));
+    }
+
+    #[test]
+    fn party_names_drop_only_whitespace_between_chinese_characters() {
+        assert_eq!(
+            normalize_party_name("新郑市芯纳半导体科技 有 限公司"),
+            "新郑市芯纳半导体科技有限公司"
+        );
+        assert_eq!(
+            normalize_party_name("ABC Technology 有限公司"),
+            "ABC Technology 有限公司"
+        );
     }
 
     #[test]
@@ -765,6 +867,26 @@ mod tests {
             Some("欧阳兆祺")
         );
         assert_eq!(extract_submitter("欧阳兆祺转接线23.9元.pdf"), None);
+    }
+
+    #[test]
+    fn submitter_supports_copy_suffixes_and_glued_amounts() {
+        assert_eq!(
+            extract_submitter("刘栩 PS2手柄 49(1).pdf").as_deref(),
+            Some("刘栩")
+        );
+        assert_eq!(
+            extract_submitter("刘栩 ps2接收模块 57.98(1)(1).pdf").as_deref(),
+            Some("刘栩")
+        );
+        assert_eq!(
+            extract_submitter("林滔 锂电池68.25元.pdf").as_deref(),
+            Some("林滔")
+        );
+        assert_eq!(
+            extract_submitter("林滔tps40345 34.00元.pdf").as_deref(),
+            Some("林滔")
+        );
     }
 
     #[test]

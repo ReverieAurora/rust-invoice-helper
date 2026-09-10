@@ -14,7 +14,7 @@ use model::{ProcessingMode, DEFAULT_MAX_FILES_PER_FOLDER};
 #[derive(Debug, Parser)]
 #[command(
     name = "invoice-helper",
-    version,
+    version = model::APP_VERSION,
     about = "带轻量内联 TUI 的 PDF 发票校验、分类与销售方汇总工具"
 )]
 struct Cli {
