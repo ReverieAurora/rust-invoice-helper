@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "invoice-helper"
-version = "0.3.1-hotfix"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",

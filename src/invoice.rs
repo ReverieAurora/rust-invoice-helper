@@ -177,18 +177,23 @@ fn process_pdf(source_root: &Path, path: &Path, mode: ProcessingMode) -> Invoice
     let file_name = display_file_name(path);
     let source_relative = path.strip_prefix(source_root).unwrap_or(path).to_path_buf();
     let sha256 = parser::file_sha256(path).unwrap_or_default();
-    let submitter = parser::extract_submitter(&file_name);
+    let initial_filename = parser::analyze_invoice_filename(&file_name, None);
+    let submitter = initial_filename.submitter.clone();
 
     match parser::extract_isolated(path) {
-        Ok(raw) => validate_record(
-            path.to_path_buf(),
-            source_relative,
-            file_name,
-            sha256,
-            submitter,
-            raw,
-            mode,
-        ),
+        Ok(raw) => {
+            let filename = parser::analyze_invoice_filename(&file_name, raw.total);
+            validate_record(
+                path.to_path_buf(),
+                source_relative,
+                file_name,
+                sha256,
+                filename.submitter,
+                filename.format_error,
+                raw,
+                mode,
+            )
+        }
         Err(reason) => {
             // 用户确认发票文件名应包含可识别的“姓名 + 物品 + 金额”。若正文解析
             // 失败且文件名也完全不符合该规则，则归入非发票 PDF；疑似发票仍进入
@@ -229,6 +234,7 @@ fn validate_record(
     file_name: String,
     sha256: String,
     submitter: Option<String>,
+    filename_format_error: Option<String>,
     raw: RawInvoiceData,
     mode: ProcessingMode,
 ) -> InvoiceRecord {
@@ -279,10 +285,15 @@ fn validate_record(
             None => issues.push(missing("购买方税号")),
         }
 
-        if submitter.is_none() {
+        if let Some(reason) = filename_format_error {
+            issues.push(ValidationIssue {
+                kind: IssueKind::FilenameFormat,
+                reason,
+            });
+        } else if submitter.is_none() {
             issues.push(ValidationIssue {
                 kind: IssueKind::SubmitterUnknown,
-                reason: "无法按“姓名 + 物品 + 金额”的文件名规则可靠识别提交人".to_owned(),
+                reason: "文件名结构有效，但无法可靠识别提交人姓名".to_owned(),
             });
         }
         if !raw.pdf_risks.is_empty() {
@@ -419,6 +430,7 @@ mod tests {
             "张三-电机-10.pdf".to_owned(),
             String::new(),
             Some("张三".to_owned()),
+            None,
             raw,
             ProcessingMode::FullValidationExport,
         );
@@ -443,6 +455,7 @@ mod tests {
             "张三-芯片-14.8元.pdf".to_owned(),
             String::new(),
             Some("张三".to_owned()),
+            None,
             raw,
             ProcessingMode::FullValidationExport,
         );
@@ -457,9 +470,38 @@ mod tests {
             "课程说明.pdf".to_owned(),
             String::new(),
             None,
+            Some("文件名格式错误".to_owned()),
             RawInvoiceData::default(),
             ProcessingMode::FullValidationExport,
         );
         assert_eq!(record.state, RecordState::NonInvoice);
+    }
+
+    #[test]
+    fn filename_format_problem_has_its_own_issue_kind() {
+        let raw = RawInvoiceData {
+            is_invoice: true,
+            buyer_name: Some(EXPECTED_BUYER_NAME.to_owned()),
+            buyer_tax_id: Some(EXPECTED_BUYER_TAX_ID.to_owned()),
+            ..RawInvoiceData::default()
+        };
+        let record = validate_record(
+            PathBuf::from("张三-只有物品.pdf"),
+            PathBuf::from("张三-只有物品.pdf"),
+            "张三-只有物品.pdf".to_owned(),
+            String::new(),
+            Some("张三".to_owned()),
+            Some("文件名格式错误".to_owned()),
+            raw,
+            ProcessingMode::FullValidationExport,
+        );
+        assert!(record
+            .issues
+            .iter()
+            .any(|issue| issue.kind == IssueKind::FilenameFormat));
+        assert!(!record
+            .issues
+            .iter()
+            .any(|issue| issue.kind == IssueKind::SubmitterUnknown));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "invoice-helper"
-version = "0.3.1-hotfix"
+version = "0.3.2"
 edition = "2021"
 description = "带轻量内联 TUI 的本地 PDF 发票校验、分类与销售方汇总工具"
 

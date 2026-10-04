@@ -151,38 +151,115 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub fn extract_submitter(file_name: &str) -> Option<String> {
-    let stem = Path::new(file_name).file_stem()?.to_string_lossy();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilenameAnalysis {
+    pub submitter: Option<String>,
+    pub amount: Option<Decimal>,
+    pub format_error: Option<String>,
+}
+
+pub fn analyze_invoice_filename(
+    file_name: &str,
+    invoice_total: Option<Decimal>,
+) -> FilenameAnalysis {
+    let Some(stem) = Path::new(file_name).file_stem() else {
+        return FilenameAnalysis {
+            submitter: None,
+            amount: None,
+            format_error: Some("文件名缺少有效的主文件名".to_owned()),
+        };
+    };
+    let stem = stem.to_string_lossy();
     let copy_suffix =
         Regex::new(r"(?:\s*[（(]\d+[）)])+$").expect("valid filename copy suffix regex");
     let stem = copy_suffix.replace(stem.trim(), "");
-    let amount_at_end = Regex::new(r"[¥￥]?\d[\d,]*(?:\.\d{1,2})?(?:元|圆)?$")
-        .expect("valid filename trailing amount regex");
-    if !amount_at_end.is_match(stem.trim()) {
-        return None;
-    }
+    let stem = stem.trim_matches(is_filename_separator);
 
     let separator = Regex::new(r"[\s_\-—–+]+").expect("valid filename separator regex");
-    let parts = separator
-        .split(stem.trim())
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>();
-    let candidate = parts.first()?.trim_matches(|character: char| {
+    let first_separator = separator.find(stem);
+    let first_component = first_separator
+        .as_ref()
+        .map_or(stem, |matched| &stem[..matched.start()]);
+    let candidate = first_component.trim_matches(|character: char| {
         matches!(
             character,
             '“' | '”' | '‘' | '’' | '"' | '\'' | '(' | ')' | '（' | '）'
         )
     });
-    if valid_submitter(candidate) {
-        return Some(candidate.to_owned());
+    let (submitter, remainder) = if valid_submitter(candidate) {
+        let remainder_start = first_separator.map_or(candidate.len(), |matched| matched.end());
+        (Some(candidate.to_owned()), &stem[remainder_start..])
+    } else {
+        // 无姓名分隔符时只接受“2～4 个中文姓名字符后直接接英文/数字”的
+        // 明确边界，例如“林滔tps40345 34.00元”。全中文连写仍不猜测。
+        let name_before_ascii =
+            Regex::new(r"^([\p{Han}·]{2,4})[A-Za-z0-9]").expect("valid compact submitter regex");
+        match name_before_ascii
+            .captures(stem)
+            .and_then(|capture| capture.get(1))
+            .filter(|matched| valid_submitter(matched.as_str()))
+        {
+            Some(matched) => (Some(matched.as_str().to_owned()), &stem[matched.end()..]),
+            None => {
+                let unknown_remainder = first_separator
+                    .as_ref()
+                    .map_or("", |matched| &stem[matched.end()..]);
+                (None, unknown_remainder)
+            }
+        }
+    };
+
+    let remainder = remainder.trim_matches(is_filename_separator);
+    let amount = filename_layout_amount(remainder);
+    let format_error = if remainder.is_empty() || amount.is_none() {
+        Some("文件名格式错误：请使用“姓名 + 物品 + 金额”或“姓名 + 金额 + 物品”".to_owned())
+    } else if let (Some(file_amount), Some(invoice_total)) = (amount, invoice_total) {
+        (file_amount != invoice_total).then(|| {
+            format!("文件名金额 {file_amount:.2} 元与发票正文价税合计 {invoice_total:.2} 元不一致")
+        })
+    } else {
+        None
+    };
+
+    FilenameAnalysis {
+        submitter,
+        amount,
+        format_error,
+    }
+}
+
+#[cfg(test)]
+pub fn extract_submitter(file_name: &str) -> Option<String> {
+    analyze_invoice_filename(file_name, None).submitter
+}
+
+fn filename_layout_amount(remainder: &str) -> Option<Decimal> {
+    // 新格式：姓名 + 金额 + 物品。金额必须是姓名后的第一个完整字段，
+    // 因此不会把物品名称末尾的型号数字误当作金额。
+    let amount_before_item =
+        Regex::new(r"^[¥￥]?([0-9][0-9,]*(?:\.[0-9]{1,2})?)(?:元|圆)?[\s_\-—–+]+(.+)$")
+            .expect("valid amount-before-item filename regex");
+    if let Some(capture) = amount_before_item.captures(remainder) {
+        let item = capture.get(2)?.as_str().trim_matches(is_filename_separator);
+        if !item.is_empty() {
+            return parse_amount(capture.get(1)?.as_str()).ok();
+        }
     }
 
-    // 无姓名分隔符时只接受“2～4 个中文姓名字符后直接接英文/数字”的
-    // 明确边界，例如“林滔tps40345 34.00元”。全中文连写仍不猜测。
-    let name_before_ascii =
-        Regex::new(r"^([\p{Han}·]{2,4})[A-Za-z0-9]").expect("valid compact submitter regex");
-    let candidate = name_before_ascii.captures(stem.trim())?.get(1)?.as_str();
-    valid_submitter(candidate).then(|| candidate.to_owned())
+    // 原格式：姓名 + 物品 + 金额。允许物品与金额粘连。
+    let amount_after_item =
+        Regex::new(r"^(.+?)[\s_\-—–+]*[¥￥]?([0-9][0-9,]*(?:\.[0-9]{1,2})?)(?:元|圆)?$")
+            .expect("valid amount-after-item filename regex");
+    let capture = amount_after_item.captures(remainder)?;
+    let item = capture.get(1)?.as_str().trim_matches(is_filename_separator);
+    if item.is_empty() {
+        return None;
+    }
+    parse_amount(capture.get(2)?.as_str()).ok()
+}
+
+fn is_filename_separator(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '_' | '-' | '—' | '–' | '+')
 }
 
 fn valid_submitter(candidate: &str) -> bool {
@@ -887,6 +964,42 @@ mod tests {
             extract_submitter("林滔tps40345 34.00元.pdf").as_deref(),
             Some("林滔")
         );
+    }
+
+    #[test]
+    fn filename_supports_amount_before_item_without_using_item_suffix_digits() {
+        let cases = [
+            ("_杨梓彦 8.2 轴承.pdf", Decimal::new(820, 2)),
+            ("杨梓彦 11_橡胶制品_皮带_.pdf", Decimal::new(1100, 2)),
+            ("杨梓彦 132 轴承_导向轴支座0.pdf", Decimal::new(13200, 2)),
+            ("杨梓彦 56.00 敏感元件及传感器0.pdf", Decimal::new(5600, 2)),
+        ];
+
+        for (file_name, expected_amount) in cases {
+            let result = analyze_invoice_filename(file_name, Some(expected_amount));
+            assert_eq!(result.submitter.as_deref(), Some("杨梓彦"));
+            assert_eq!(result.amount, Some(expected_amount));
+            assert_eq!(result.format_error, None);
+        }
+    }
+
+    #[test]
+    fn filename_amount_must_match_invoice_total() {
+        let result =
+            analyze_invoice_filename("杨梓彦 132 轴承_导向轴支座0.pdf", Some(Decimal::ZERO));
+        assert_eq!(result.submitter.as_deref(), Some("杨梓彦"));
+        assert_eq!(result.amount, Some(Decimal::new(13200, 2)));
+        assert!(result
+            .format_error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("与发票正文价税合计")));
+    }
+
+    #[test]
+    fn malformed_filename_reports_format_error_separately() {
+        let result = analyze_invoice_filename("张三_电机.pdf", Some(Decimal::TEN));
+        assert_eq!(result.submitter.as_deref(), Some("张三"));
+        assert!(result.format_error.is_some());
     }
 
     #[test]

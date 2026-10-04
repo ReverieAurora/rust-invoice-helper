@@ -23,8 +23,9 @@ use crate::runtime_log;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-const INLINE_HEIGHT: u16 = 17;
+const INLINE_HEIGHT: u16 = 18;
 const MAX_CONTENT_WIDTH: u16 = 88;
+const DEFAULT_AUTO_SAVE_LOG: bool = true;
 const ACCENT: Color = Color::Rgb(217, 119, 87);
 const TEXT: Color = Color::Rgb(235, 235, 235);
 const MUTED: Color = Color::Rgb(128, 128, 128);
@@ -35,27 +36,38 @@ const ERROR: Color = Color::Rgb(220, 95, 95);
 
 pub fn run() -> Result<()> {
     let mut terminal = TerminalSession::new()?;
+    let mut remembered_mode = ProcessingMode::FullValidationExport;
     let mut remembered_batch_limit = Some(DEFAULT_MAX_FILES_PER_FOLDER);
+    let mut remembered_auto_log = DEFAULT_AUTO_SAVE_LOG;
 
     loop {
         let SetupAction::Start {
             mode,
             source_folder,
             max_files_per_folder,
-        } = setup_screen(&mut terminal, remembered_batch_limit)?
+            auto_save_log,
+        } = setup_screen(
+            &mut terminal,
+            remembered_mode,
+            remembered_batch_limit,
+            remembered_auto_log,
+        )?
         else {
             runtime_log::info("程序退出 | interface=tui | reason=user_quit");
             return Ok(());
         };
+        remembered_mode = mode;
         remembered_batch_limit = max_files_per_folder;
+        remembered_auto_log = auto_save_log;
         let started = Instant::now();
         runtime_log::info(format!(
-            "开始处理 | interface=tui | mode={} | source={} | batch_limit={}",
+            "开始处理 | interface=tui | mode={} | source={} | batch_limit={} | auto_save_log={}",
             mode.label(),
             source_folder.display(),
             max_files_per_folder
                 .map(|limit| limit.to_string())
-                .unwrap_or_else(|| "unlimited".to_owned())
+                .unwrap_or_else(|| "unlimited".to_owned()),
+            auto_save_log
         ));
 
         match process_with_progress(&mut terminal, &source_folder, mode, max_files_per_folder) {
@@ -70,8 +82,10 @@ pub fn run() -> Result<()> {
                     result.qualified_count,
                     result.output.display()
                 ));
+                let log_folder = completed_log_folder(&result, mode, &source_folder);
+                let log_notice = auto_log_notice(log_folder, auto_save_log, "处理结果");
                 drain_pending_events()?;
-                if completion_screen(&mut terminal, &result)? == NextAction::Exit {
+                if completion_screen(&mut terminal, &result, log_notice)? == NextAction::Exit {
                     runtime_log::info("程序退出 | interface=tui | reason=completed");
                     return Ok(());
                 }
@@ -83,8 +97,15 @@ pub fn run() -> Result<()> {
                     mode.label(),
                     source_folder.display()
                 ));
+                let log_notice = auto_log_notice(
+                    &source_folder,
+                    auto_save_log,
+                    "来源目录（处理失败，未生成结果目录）",
+                );
                 drain_pending_events()?;
-                if error_screen(&mut terminal, &format!("{error:#}"))? == NextAction::Exit {
+                if error_screen(&mut terminal, &format!("{error:#}"), log_notice)?
+                    == NextAction::Exit
+                {
                     runtime_log::info("程序退出 | interface=tui | reason=error_screen");
                     return Ok(());
                 }
@@ -98,6 +119,7 @@ enum SetupAction {
         mode: ProcessingMode,
         source_folder: PathBuf,
         max_files_per_folder: Option<usize>,
+        auto_save_log: bool,
     },
     Quit,
 }
@@ -108,15 +130,39 @@ enum NextAction {
     Exit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupPage {
+    Main,
+    Settings,
+}
+
+struct SetupView<'a> {
+    page: SetupPage,
+    selected_main: usize,
+    selected_setting: usize,
+    mode: ProcessingMode,
+    source_folder: Option<&'a Path>,
+    max_files_per_folder: Option<usize>,
+    auto_save_log: bool,
+    batch_limit_input: Option<&'a str>,
+    notice: &'a str,
+}
+
 fn setup_screen(
     terminal: &mut TerminalSession,
+    initial_mode: ProcessingMode,
     initial_batch_limit: Option<usize>,
+    initial_auto_log: bool,
 ) -> Result<SetupAction> {
-    let mut selected_mode = 0_usize;
+    let mut page = SetupPage::Main;
+    let mut selected_main = 0_usize;
+    let mut selected_setting = 0_usize;
+    let mut mode = initial_mode;
     let mut source_folder = None;
     let mut max_files_per_folder = initial_batch_limit;
+    let mut auto_save_log = initial_auto_log;
     let mut batch_limit_input = None::<String>;
-    let mut notice = "直接按 Enter，选择文件夹后自动开始".to_owned();
+    let mut notice = "使用 ↑/↓ 选择，按 Enter 确认".to_owned();
 
     loop {
         terminal
@@ -124,11 +170,17 @@ fn setup_screen(
             .draw(|frame| {
                 render_setup(
                     frame,
-                    selected_mode,
-                    source_folder.as_deref(),
-                    max_files_per_folder,
-                    batch_limit_input.as_deref(),
-                    &notice,
+                    SetupView {
+                        page,
+                        selected_main,
+                        selected_setting,
+                        mode,
+                        source_folder: source_folder.as_deref(),
+                        max_files_per_folder,
+                        auto_save_log,
+                        batch_limit_input: batch_limit_input.as_deref(),
+                        notice: &notice,
+                    },
                 )
             })
             .context("无法绘制 TUI 设置界面")?;
@@ -171,49 +223,82 @@ fn setup_screen(
             continue;
         }
 
-        match key {
-            KeyCode::Up => selected_mode = selected_mode.saturating_sub(1),
-            KeyCode::Down => {
-                selected_mode =
-                    (selected_mode + 1).min(ProcessingMode::ALL.len().saturating_sub(1));
-            }
-            KeyCode::Char('1') => selected_mode = 0,
-            KeyCode::Char('2') if ProcessingMode::ALL.len() >= 2 => selected_mode = 1,
-            KeyCode::Char('m' | 'M') => {
-                batch_limit_input = Some(String::new());
-                notice = "输入每个发票文件夹的上限；0 表示不限制".to_owned();
-            }
-            KeyCode::Char('l' | 'L') => {
-                notice = export_log_notice(terminal)?;
-            }
-            KeyCode::Char('f' | 'F' | 'o' | 'O') => {
-                if let Some(folder) = pick_source_folder(terminal)? {
-                    notice = "目录已选择；按 Enter 开始处理".to_owned();
-                    source_folder = Some(folder);
-                } else {
-                    notice = "已取消文件夹选择".to_owned();
+        match page {
+            SetupPage::Main => match key {
+                KeyCode::Up => selected_main = selected_main.saturating_sub(1),
+                KeyCode::Down => selected_main = (selected_main + 1).min(3),
+                KeyCode::Enter => match selected_main {
+                    0 => {
+                        let folder = if let Some(folder) = source_folder.clone() {
+                            Some(folder)
+                        } else {
+                            pick_source_folder(terminal)?
+                        };
+                        if let Some(folder) = folder {
+                            return Ok(SetupAction::Start {
+                                mode,
+                                source_folder: folder,
+                                max_files_per_folder,
+                                auto_save_log,
+                            });
+                        }
+                        notice = "已取消选择来源目录".to_owned();
+                    }
+                    1 => {
+                        if let Some(folder) = pick_source_folder(terminal)? {
+                            source_folder = Some(folder);
+                            notice = "来源目录已更新".to_owned();
+                        } else {
+                            notice = "已取消选择来源目录".to_owned();
+                        }
+                    }
+                    2 => {
+                        page = SetupPage::Settings;
+                        selected_setting = 0;
+                        notice = "选择设置项并按 Enter 修改".to_owned();
+                    }
+                    _ => return Ok(SetupAction::Quit),
+                },
+                KeyCode::Esc => return Ok(SetupAction::Quit),
+                _ => {}
+            },
+            SetupPage::Settings => match key {
+                KeyCode::Up => selected_setting = selected_setting.saturating_sub(1),
+                KeyCode::Down => selected_setting = (selected_setting + 1).min(4),
+                KeyCode::Enter => match selected_setting {
+                    0 => {
+                        mode = match mode {
+                            ProcessingMode::FullValidationExport => ProcessingMode::QuickSummary,
+                            ProcessingMode::QuickSummary => ProcessingMode::FullValidationExport,
+                        };
+                        notice = format!("处理模式已切换为：{}", mode.label());
+                    }
+                    1 => {
+                        batch_limit_input = Some(String::new());
+                        notice = "输入上限；0 表示不限制，然后按 Enter 保存".to_owned();
+                    }
+                    2 => {
+                        auto_save_log = !auto_save_log;
+                        notice = if auto_save_log {
+                            "自动日志已开启；成功后保存到处理结果中".to_owned()
+                        } else {
+                            "自动日志已关闭；仍可在设置中手动另存".to_owned()
+                        };
+                    }
+                    3 => notice = export_log_notice(terminal)?,
+                    _ => {
+                        page = SetupPage::Main;
+                        selected_main = 0;
+                        notice = "设置已保留；选择“开始处理”继续".to_owned();
+                    }
+                },
+                KeyCode::Esc => {
+                    page = SetupPage::Main;
+                    selected_main = 0;
+                    notice = "已返回主菜单".to_owned();
                 }
-            }
-            KeyCode::Enter => {
-                if let Some(folder) = source_folder.clone() {
-                    return Ok(SetupAction::Start {
-                        mode: ProcessingMode::ALL[selected_mode],
-                        source_folder: folder,
-                        max_files_per_folder,
-                    });
-                }
-
-                if let Some(folder) = pick_source_folder(terminal)? {
-                    return Ok(SetupAction::Start {
-                        mode: ProcessingMode::ALL[selected_mode],
-                        source_folder: folder,
-                        max_files_per_folder,
-                    });
-                }
-                notice = "已取消；按 Enter 可以重新选择".to_owned();
-            }
-            KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Ok(SetupAction::Quit),
-            _ => {}
+                _ => {}
+            },
         }
     }
 }
@@ -239,7 +324,7 @@ fn export_log_notice(terminal: &mut TerminalSession) -> Result<String> {
     drain_dialog_events()?;
 
     let Some(path) = selected else {
-        return Ok("已取消导出；关闭程序不会保存运行日志".to_owned());
+        return Ok("已取消手动导出".to_owned());
     };
     runtime_log::info(format!("用户选择导出运行日志 | path={}", path.display()));
     match runtime_log::export(&path) {
@@ -247,6 +332,36 @@ fn export_log_notice(terminal: &mut TerminalSession) -> Result<String> {
         Err(error) => {
             runtime_log::error(format!("导出运行日志失败 | error={error:#}"));
             Ok(format!("运行日志导出失败：{error:#}"))
+        }
+    }
+}
+
+fn completed_log_folder<'a>(
+    result: &'a ProcessResult,
+    mode: ProcessingMode,
+    source_folder: &'a Path,
+) -> &'a Path {
+    match mode {
+        ProcessingMode::FullValidationExport => &result.output,
+        ProcessingMode::QuickSummary => result.output.parent().unwrap_or(source_folder),
+    }
+}
+
+fn auto_log_notice(target_folder: &Path, enabled: bool, destination: &str) -> String {
+    if !enabled {
+        runtime_log::info("自动导出运行日志已关闭");
+        return "自动日志已关闭；可在菜单中手动另存".to_owned();
+    }
+
+    runtime_log::info(format!(
+        "准备自动导出运行日志 | destination={destination} | folder={}",
+        target_folder.display()
+    ));
+    match runtime_log::export_to_folder(target_folder) {
+        Ok(path) => format!("运行日志已自动保存：{}", path.display()),
+        Err(error) => {
+            runtime_log::error(format!("自动导出运行日志失败 | error={error:#}"));
+            format!("运行日志自动保存失败：{error:#}；可从菜单另存")
         }
     }
 }
@@ -292,52 +407,72 @@ fn process_with_progress(
     result
 }
 
-fn completion_screen(terminal: &mut TerminalSession, result: &ProcessResult) -> Result<NextAction> {
-    let mut notice = "按 L 可选择位置导出运行日志；直接退出不会保存".to_owned();
+fn completion_screen(
+    terminal: &mut TerminalSession,
+    result: &ProcessResult,
+    initial_notice: String,
+) -> Result<NextAction> {
+    let mut notice = initial_notice;
+    let mut selected = 0_usize;
     loop {
         terminal
             .terminal
-            .draw(|frame| render_completion(frame, result, &notice))
+            .draw(|frame| render_completion(frame, result, &notice, selected))
             .context("无法绘制 TUI 完成界面")?;
 
         match read_key()? {
-            KeyCode::Char('l' | 'L') => notice = export_log_notice(terminal)?,
-            KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
-                return Ok(NextAction::Exit);
-            }
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(2),
+            KeyCode::Enter => match selected {
+                0 => return Ok(NextAction::Exit),
+                1 => return Ok(NextAction::Again),
+                _ => notice = export_log_notice(terminal)?,
+            },
+            KeyCode::Esc => return Ok(NextAction::Exit),
             _ => {}
         }
     }
 }
 
-fn error_screen(terminal: &mut TerminalSession, message: &str) -> Result<NextAction> {
-    let mut notice = "按 L 可选择位置导出运行日志；直接退出不会保存".to_owned();
+fn error_screen(
+    terminal: &mut TerminalSession,
+    message: &str,
+    initial_notice: String,
+) -> Result<NextAction> {
+    let mut notice = initial_notice;
+    let mut selected = 0_usize;
     loop {
         terminal
             .terminal
-            .draw(|frame| render_error(frame, message, &notice))
+            .draw(|frame| render_error(frame, message, &notice, selected))
             .context("无法绘制 TUI 错误界面")?;
 
         match read_key()? {
-            KeyCode::Char('l' | 'L') => notice = export_log_notice(terminal)?,
-            KeyCode::Char('r' | 'R') => return Ok(NextAction::Again),
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
-                return Ok(NextAction::Exit);
-            }
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(2),
+            KeyCode::Enter => match selected {
+                0 => return Ok(NextAction::Again),
+                1 => notice = export_log_notice(terminal)?,
+                _ => return Ok(NextAction::Exit),
+            },
+            KeyCode::Esc => return Ok(NextAction::Exit),
             _ => {}
         }
     }
 }
 
-fn render_setup(
-    frame: &mut Frame,
-    selected_mode: usize,
-    source_folder: Option<&Path>,
-    max_files_per_folder: Option<usize>,
-    batch_limit_input: Option<&str>,
-    notice: &str,
-) {
+fn render_setup(frame: &mut Frame, view: SetupView<'_>) {
+    let SetupView {
+        page,
+        selected_main,
+        selected_setting,
+        mode,
+        source_folder,
+        max_files_per_folder,
+        auto_save_log,
+        batch_limit_input,
+        notice,
+    } = view;
     frame.render_widget(Clear, frame.area());
     let area = centered_content(frame.area());
     let path = source_folder
@@ -345,91 +480,100 @@ fn render_setup(
         .unwrap_or_else(|| "尚未选择".to_owned());
     let path = truncate_middle(&path, area.width.saturating_sub(8) as usize);
 
-    let mut lines = vec![brand_line("设置"), subtitle_line(), divider(area.width)];
-    lines.push(Line::from(Span::styled(
-        "  选择处理方式",
-        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::default());
-
-    for (index, mode) in ProcessingMode::ALL.iter().enumerate() {
-        let selected = index == selected_mode;
-        let rail = if selected { "  │ " } else { "    " };
-        let marker = if selected { "❯ " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                rail,
-                Style::default().fg(if selected { ACCENT } else { SUBTLE }),
-            ),
-            Span::styled(
-                marker,
-                Style::default()
-                    .fg(if selected { ACCENT } else { SUBTLE })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                mode.label(),
-                Style::default()
-                    .fg(if selected { TEXT } else { MUTED })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{}{}",
-                if selected { "  │   " } else { "      " },
-                mode.description()
-            ),
-            Style::default().fg(if selected { MUTED } else { SUBTLE }),
-        )));
-    }
-
-    let (batch_value, batch_style, batch_hint) = match batch_limit_input {
-        Some(input) => (
-            format!("{input}▌"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            "  0 = 不限制 · Enter 确认 · Esc 取消",
-        ),
-        None => (
-            batch_limit_description(max_files_per_folder),
-            Style::default().fg(TEXT),
-            "  M 修改",
-        ),
+    let page_name = if page == SetupPage::Main {
+        "主页"
+    } else {
+        "设置"
     };
+    let mut lines = vec![brand_line(page_name), subtitle_line(), divider(area.width)];
 
-    lines.extend([
-        Line::default(),
-        Line::from(vec![
-            Span::styled("  分批上限  ", Style::default().fg(MUTED)),
-            Span::styled(batch_value, batch_style),
-            Span::styled(batch_hint, Style::default().fg(SUBTLE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  来源目录  ", Style::default().fg(MUTED)),
-            Span::styled(
-                path,
-                Style::default().fg(if source_folder.is_some() {
+    if let Some(input) = batch_limit_input {
+        lines.extend([
+            Line::from(Span::styled(
+                "  自定义分批上限",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("  数量  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{input}▌"),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "  输入 0 表示不限制",
+                Style::default().fg(SUBTLE),
+            )),
+            Line::default(),
+        ]);
+    } else if page == SetupPage::Main {
+        lines.extend([
+            status_line("处理模式", mode.label(), TEXT),
+            status_line(
+                "分批上限",
+                &batch_limit_description(max_files_per_folder),
+                TEXT,
+            ),
+            status_line(
+                "运行日志",
+                if auto_save_log {
+                    "开启 · 自动保存到处理结果"
+                } else {
+                    "关闭"
+                },
+                if auto_save_log { SUCCESS } else { WARNING },
+            ),
+            status_line(
+                "来源目录",
+                &path,
+                if source_folder.is_some() {
                     TEXT
                 } else {
                     WARNING
-                }),
+                },
             ),
-        ]),
-        Line::default(),
+            Line::default(),
+            menu_line("开始处理", "选择目录后运行", selected_main == 0),
+            menu_line("选择来源目录", "只更换目录", selected_main == 1),
+            menu_line("设置", "模式、分批与日志", selected_main == 2),
+            menu_line("退出", "关闭程序", selected_main == 3),
+        ]);
+    } else {
+        lines.extend([
+            menu_line("处理模式", mode.label(), selected_setting == 0),
+            menu_line(
+                "分批上限",
+                &batch_limit_description(max_files_per_folder),
+                selected_setting == 1,
+            ),
+            menu_line(
+                "自动保存日志",
+                if auto_save_log { "开启" } else { "关闭" },
+                selected_setting == 2,
+            ),
+            menu_line("手动另存日志", "选择保存位置", selected_setting == 3),
+            menu_line("返回", "回到主菜单", selected_setting == 4),
+            Line::default(),
+        ]);
+    }
+
+    lines.extend([
         Line::from(Span::styled(
             format!("  {notice}"),
-            Style::default().fg(if notice.contains("取消") {
-                WARNING
-            } else {
-                MUTED
-            }),
+            log_notice_style(notice),
         )),
         divider(area.width),
-        setup_footer(area.width),
+        if batch_limit_input.is_some() {
+            key_hints(&[
+                ("数字", "输入"),
+                ("Backspace", "删除"),
+                ("Enter", "保存"),
+                ("Esc", "取消"),
+            ])
+        } else {
+            navigation_footer()
+        },
     ]);
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -518,7 +662,7 @@ fn render_progress(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_completion(frame: &mut Frame, result: &ProcessResult, notice: &str) {
+fn render_completion(frame: &mut Frame, result: &ProcessResult, notice: &str, selected: usize) {
     frame.render_widget(Clear, frame.area());
     let area = centered_content(frame.area());
     let output = truncate_middle(
@@ -569,17 +713,16 @@ fn render_completion(frame: &mut Frame, result: &ProcessResult, notice: &str) {
             log_notice_style(&notice),
         )),
         divider(area.width),
-        key_hints(&[
-            ("Enter", "退出"),
-            ("L", "导出日志"),
-            ("R", "再处理一个目录"),
-        ]),
+        menu_line("退出", "关闭程序", selected == 0),
+        menu_line("再处理一个目录", "返回主菜单", selected == 1),
+        menu_line("手动另存日志", "选择保存位置", selected == 2),
+        navigation_footer(),
     ];
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_error(frame: &mut Frame, message: &str, notice: &str) {
+fn render_error(frame: &mut Frame, message: &str, notice: &str, selected: usize) {
     frame.render_widget(Clear, frame.area());
     let area = centered_content(frame.area());
     let message = truncate_middle(message, area.width.saturating_sub(4) as usize * 3);
@@ -606,7 +749,10 @@ fn render_error(frame: &mut Frame, message: &str, notice: &str) {
             log_notice_style(&notice),
         )),
         divider(area.width),
-        key_hints(&[("L", "导出日志"), ("R", "返回重新选择"), ("Enter", "退出")]),
+        menu_line("返回重新选择", "回到主菜单", selected == 0),
+        menu_line("手动另存日志", "选择保存位置", selected == 1),
+        menu_line("退出", "关闭程序", selected == 2),
+        navigation_footer(),
     ];
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -636,25 +782,44 @@ fn subtitle_line() -> Line<'static> {
     ))
 }
 
-fn setup_footer(width: u16) -> Line<'static> {
-    if width < 82 {
-        key_hints(&[
-            ("Enter", "开始"),
-            ("↑↓", "模式"),
-            ("M", "分批"),
-            ("L", "日志"),
-            ("Q", "退出"),
-        ])
-    } else {
-        key_hints(&[
-            ("Enter", "开始"),
-            ("↑↓", "模式"),
-            ("M", "分批上限"),
-            ("F", "选择目录"),
-            ("L", "导出日志"),
-            ("Q", "退出"),
-        ])
-    }
+fn status_line(label: &str, value: &str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<8}"), Style::default().fg(MUTED)),
+        Span::styled(value.to_owned(), Style::default().fg(color)),
+    ])
+}
+
+fn menu_line(label: &str, detail: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if selected { "  │ " } else { "    " },
+            Style::default().fg(if selected { ACCENT } else { SUBTLE }),
+        ),
+        Span::styled(
+            if selected { "❯ " } else { "  " },
+            Style::default()
+                .fg(if selected { ACCENT } else { SUBTLE })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label.to_owned(),
+            Style::default()
+                .fg(if selected { TEXT } else { MUTED })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::styled(
+            format!("  {detail}"),
+            Style::default().fg(if selected { MUTED } else { SUBTLE }),
+        ),
+    ])
+}
+
+fn navigation_footer() -> Line<'static> {
+    key_hints(&[("↑/↓", "选择"), ("Enter", "确认")])
 }
 
 fn log_notice_style(notice: &str) -> Style {
@@ -880,5 +1045,31 @@ mod tests {
         assert_eq!(parse_batch_limit_input("1"), Ok(Some(1)));
         assert_eq!(parse_batch_limit_input("0"), Ok(None));
         assert!(parse_batch_limit_input("").is_err());
+    }
+
+    #[test]
+    fn completed_log_uses_the_processing_result_location() {
+        let source = Path::new(r"C:\发票");
+        let full_result = ProcessResult {
+            output: PathBuf::from(r"C:\发票\发票处理结果_20261004"),
+            pdf_count: 1,
+            success_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            qualified_count: 0,
+        };
+        assert_eq!(
+            completed_log_folder(&full_result, ProcessingMode::FullValidationExport, source),
+            full_result.output
+        );
+
+        let quick_result = ProcessResult {
+            output: PathBuf::from(r"C:\发票\发票汇总_20261004.md"),
+            ..full_result
+        };
+        assert_eq!(
+            completed_log_folder(&quick_result, ProcessingMode::QuickSummary, source),
+            Path::new(r"C:\发票")
+        );
     }
 }
