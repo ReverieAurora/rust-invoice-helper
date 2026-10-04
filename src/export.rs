@@ -30,10 +30,7 @@ pub fn export_full(
         .with_context(|| format!("无法创建临时结果目录：{}", staging.display()))?;
 
     copy_classified_files(&staging, records, max_files_per_folder)?;
-    write_summary_workbook(&staging.join("汇总表.xlsx"), records, summaries, mode)?;
-    write_submitter_workbook(&staging.join("个人开票金额统计.xlsx"), records)?;
-    write_error_workbook(&staging.join("错误追查表.xlsx"), records)?;
-    write_payment_workbook(&staging.join("支付截图补充表.xlsx"), records)?;
+    write_workbooks(&staging, records, summaries, mode)?;
     write_report(
         &staging.join("处理报告.md"),
         source_folder,
@@ -278,6 +275,69 @@ fn safe_component(value: &str) -> String {
     } else {
         result
     }
+}
+
+fn write_workbooks(
+    root: &Path,
+    records: &[InvoiceRecord],
+    summaries: &SellerSummaries,
+    mode: ProcessingMode,
+) -> Result<()> {
+    if has_summary_workbook_data(records, summaries) {
+        write_summary_workbook(&root.join("汇总表.xlsx"), records, summaries, mode)?;
+    }
+    if has_submitter_workbook_data(records) {
+        write_submitter_workbook(&root.join("个人开票金额统计.xlsx"), records)?;
+    }
+    if has_error_workbook_data(records) {
+        write_error_workbook(&root.join("错误追查表.xlsx"), records)?;
+    }
+    if has_payment_workbook_data(records) {
+        write_payment_workbook(&root.join("支付截图补充表.xlsx"), records)?;
+    }
+    Ok(())
+}
+
+fn has_summary_workbook_data(records: &[InvoiceRecord], summaries: &SellerSummaries) -> bool {
+    !records.is_empty() || !summaries.is_empty()
+}
+
+fn has_submitter_workbook_data(records: &[InvoiceRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.state == RecordState::Valid && record.raw.total.is_some())
+}
+
+fn has_error_workbook_data(records: &[InvoiceRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.state != RecordState::Valid)
+}
+
+fn has_payment_workbook_data(records: &[InvoiceRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.state == RecordState::Valid && record.high_value_seller)
+}
+
+fn generated_workbook_names(
+    records: &[InvoiceRecord],
+    summaries: &SellerSummaries,
+) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if has_summary_workbook_data(records, summaries) {
+        names.push("汇总表.xlsx");
+    }
+    if has_submitter_workbook_data(records) {
+        names.push("个人开票金额统计.xlsx");
+    }
+    if has_error_workbook_data(records) {
+        names.push("错误追查表.xlsx");
+    }
+    if has_payment_workbook_data(records) {
+        names.push("支付截图补充表.xlsx");
+    }
+    names
 }
 
 fn write_summary_workbook(
@@ -550,12 +610,23 @@ fn write_report(
         }
         (ProcessingMode::QuickSummary, _) => "不适用（快速模式不复制 PDF）".to_owned(),
     };
+    let generated_excel = if mode == ProcessingMode::FullValidationExport {
+        let names = generated_workbook_names(records, summaries);
+        if names.is_empty() {
+            "无（没有可写入表格的数据）".to_owned()
+        } else {
+            names.join("、")
+        }
+    } else {
+        "无（快速汇总模式不生成 Excel）".to_owned()
+    };
     let mut output = format!(
-        "# 发票处理报告\n\n- 生成时间：{}\n- 来源目录：`{}`\n- 处理模式：{}\n- 分类分批：{}\n- PDF 总数：{}\n- 有效发票：{}\n- 无效/待核查发票：{}\n- 非发票 PDF：{}\n- 统计阈值：销售方有效发票累计金额 ≥ 1000.00 元\n\n",
+        "# 发票处理报告\n\n- 生成时间：{}\n- 来源目录：`{}`\n- 处理模式：{}\n- 分类分批：{}\n- 生成 Excel：{}\n- PDF 总数：{}\n- 有效发票：{}\n- 无效/待核查发票：{}\n- 非发票 PDF：{}\n- 统计阈值：销售方有效发票累计金额 ≥ 1000.00 元\n\n",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         source_folder.display(),
         mode.label(),
         batch_setting,
+        generated_excel,
         records.len(),
         valid,
         invalid,
@@ -688,6 +759,7 @@ fn unique_report_path(folder: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::model::RawInvoiceData;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sanitizes_windows_path_component() {
@@ -744,6 +816,53 @@ mod tests {
             .map(|(_, batch)| batch)
             .collect::<Vec<_>>();
         assert_eq!(batches, vec![1, 1, 2, 2, 3]);
+    }
+
+    #[test]
+    fn workbooks_are_generated_only_when_they_have_data_rows() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应晚于Unix纪元")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "invoice-helper-workbook-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("应能创建测试目录");
+        let summaries = SellerSummaries::new();
+
+        write_workbooks(&root, &[], &summaries, ProcessingMode::FullValidationExport)
+            .expect("空数据不应生成表格");
+        assert_eq!(fs::read_dir(&root).expect("应能读取测试目录").count(), 0);
+
+        let mut valid = test_record("张三_电机_10.pdf", "甲公司");
+        valid.high_value_seller = false;
+        valid.raw.total = Some(Decimal::TEN);
+        write_workbooks(
+            &root,
+            &[valid],
+            &summaries,
+            ProcessingMode::FullValidationExport,
+        )
+        .expect("应能生成有数据的表格");
+        assert!(root.join("汇总表.xlsx").is_file());
+        assert!(root.join("个人开票金额统计.xlsx").is_file());
+        assert!(!root.join("错误追查表.xlsx").exists());
+        assert!(!root.join("支付截图补充表.xlsx").exists());
+
+        let mut invalid = test_record("错误.pdf", "");
+        invalid.state = RecordState::Invalid;
+        invalid.high_value_seller = false;
+        write_workbooks(
+            &root,
+            &[invalid],
+            &summaries,
+            ProcessingMode::FullValidationExport,
+        )
+        .expect("存在错误记录时应能生成错误追查表");
+        assert!(root.join("错误追查表.xlsx").is_file());
+
+        fs::remove_dir_all(root).expect("应能清理测试目录");
     }
 
     fn test_record(file_name: &str, seller: &str) -> InvoiceRecord {

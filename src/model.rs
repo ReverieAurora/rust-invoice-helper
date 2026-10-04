@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-pub const APP_VERSION: &str = "0.3.2";
+pub const APP_VERSION: &str = "0.3.2hotfix";
 pub const THOUSAND_YUAN: Decimal = Decimal::from_parts(1000, 0, 0, false, 0);
 pub const EXPECTED_BUYER_NAME: &str = "广东工业大学";
 pub const EXPECTED_BUYER_TAX_ID: &str = "12440000455860226X";
